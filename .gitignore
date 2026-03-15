@@ -25,11 +25,35 @@ coverage.xml
 # Alembic versions (auto-generated)
 health_service/db/migrations/versions/
 
-# IDE
+# ─── Frontend (Expo / React Native) ──────────────────────────────────────────
+
+# Dependencies
+frontend/node_modules/
+
+# Expo
+frontend/.expo/
+frontend/dist/
+frontend/web-build/
+
+# React Native build artifacts
+frontend/android/
+frontend/ios/
+
+# Metro bundler cache
+frontend/.metro-health-check*
+
+# TypeScript build output
+frontend/*.tsbuildinfo
+
+# Expo local secrets (never contains real secrets but keep out of git)
+frontend/.env.local
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# macOS
+# ─── macOS ───────────────────────────────────────────────────────────────────
 .DS_Store
+Thumbs.db

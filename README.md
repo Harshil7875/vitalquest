@@ -202,6 +202,8 @@ Architected from day one for **HIPAA** (US) and **DPDP Act** (India).
 
 ## Tech Stack
 
+### Backend
+
 | Layer | Technology |
 |-------|-----------|
 | Backend | Python 3.12, FastAPI |
@@ -216,9 +218,27 @@ Architected from day one for **HIPAA** (US) and **DPDP Act** (India).
 | Scheduler | APScheduler — guild cron (23:59 UTC), OAuth token rotation (every 50 min) |
 | Containers | Docker Compose — 4 services, network-segmented |
 
+### Frontend
+
+| Layer | Technology |
+|-------|-----------|
+| Framework | Expo 51 (React Native Web) — single codebase for iOS, Android, and Chrome |
+| Routing | Expo Router (file-based) — deep linking, auth-gating, biometric-gating |
+| Game Rendering | React Native Skia — 60 FPS Sanctuary canvas; compiles to WebGL on web |
+| Animations | React Native Reanimated — shared values on the native UI thread |
+| State (game) | Zustand — Mana, buildings, guild; persisted to AsyncStorage |
+| State (clinical) | Zustand — daily goals, offline queue; PHI auto-cleared on app-background |
+| Data Fetching | TanStack Query (React Query) — caching, retries, optimistic updates |
+| Secure Storage | expo-secure-store (iOS/Android) / sessionStorage (web) |
+| Auth | expo-local-authentication — FaceID/TouchID biometric gate for clinical routes |
+| Offline | NetInfo listener + idempotency-key offline queue with background flush |
+| Web Dev Tooling | Dev Mock Panel — simulates health hardware in Chrome without a real device |
+
 ---
 
 ## Getting Started
+
+### Backend
 
 ```bash
 # 1. Clone
@@ -243,6 +263,28 @@ Services:
 - Game Service (direct): `http://localhost:8001`
 
 APNs and FCM credentials are optional for local development — the notification worker gracefully skips sends if keys are absent.
+
+### Frontend
+
+```bash
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start on web (recommended for local dev — enables the Dev Mock Panel)
+npm run web
+
+# Start on iOS simulator
+npm run ios
+
+# Start on Android emulator
+npm run android
+```
+
+The web build launches at `http://localhost:8081`. It renders the app in a constrained 428 px mobile-width column with the **Dev Mock Panel** docked to the right — click any button on the panel to inject synthetic health payloads into the running backend and watch the Mana balance update in real time.
+
+> **Prerequisite:** the backend must be running (`docker compose up`) before starting the frontend. The frontend points to `http://localhost:80` (the Nginx gateway) by default. Override with `EXPO_PUBLIC_API_URL` in `frontend/.env.local`.
 
 ---
 
@@ -279,6 +321,39 @@ vitalquest/
 │
 ├── nginx/
 │   └── nginx.conf                 # Routing + rate limiting (webhooks, auth, health, game)
+│
+├── frontend/                      # Expo (React Native Web) — iOS, Android, Chrome
+│   ├── app/                       # Expo Router file-based routes
+│   │   ├── _layout.tsx            # Root: QueryClient, ThemeProvider, NetInfo flush
+│   │   ├── index.tsx              # Auth-gate redirect (→ sanctuary or login)
+│   │   ├── login.tsx
+│   │   ├── register.tsx
+│   │   ├── (game)/                # Auth-gated game routes
+│   │   │   ├── sanctuary.tsx      # Skia canvas, stat bar, manual sync
+│   │   │   ├── guild.tsx          # Guild management + live chat
+│   │   │   └── avatar.tsx         # Level, currencies, loot chest
+│   │   └── (clinical)/            # Biometric-double-gated clinical routes
+│   │       ├── dashboard.tsx      # Goals, progress, A1C chart placeholder
+│   │       └── export.tsx         # Pro-gated health report export
+│   ├── components/
+│   │   ├── HeaderBar.tsx          # Dual mode: game (Mana/Level) vs clinical (sync status)
+│   │   ├── DevMockPanel.tsx       # Web-only: injects synthetic health payloads
+│   │   ├── SanctuaryCanvas.tsx    # React Native Skia 2×2 building grid
+│   │   ├── UpgradeBuildingModal.tsx
+│   │   └── GuildChat.tsx          # 5-second polling, PHI-scrubbed
+│   ├── features/
+│   │   ├── auth/                  # useAuth hook, SecureStore token storage
+│   │   └── hardware/              # HAL: lazy-loads mobile or web-mock implementation
+│   ├── services/api/
+│   │   ├── client.ts              # Fetch wrapper with auto-JWT + typed ApiError
+│   │   └── hooks.ts               # All TanStack Query hooks (game, health, guild, clinical)
+│   ├── store/
+│   │   ├── useGameStore.ts        # Zustand: Mana, buildings, guild (persisted)
+│   │   └── useClinicalStore.ts    # Zustand: goals, offline queue (PHI auto-clear)
+│   ├── theme/
+│   │   ├── tokens.ts              # gameTheme (purples/gold) + clinicalTheme (whites/blues)
+│   │   └── ThemeProvider.tsx      # Context toggled by routing state
+│   └── types/index.ts             # Shared TypeScript interfaces (mirrors backend schemas)
 │
 └── docker-compose.yml             # 4 containers; network-segmented (health_net / game_net)
 ```
