@@ -22,8 +22,7 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Alembic versions (auto-generated)
-health_service/db/migrations/versions/
+# Alembic versions are tracked in git — do not ignore
 
 # ─── Frontend (Expo / React Native) ──────────────────────────────────────────
 
