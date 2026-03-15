@@ -7,6 +7,7 @@ sqlalchemy[asyncio]==2.0.35
 asyncpg==0.29.0
 alembic==1.13.3
 passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
 python-jose[cryptography]==3.3.0
 redis[asyncio]==5.0.8
 apscheduler==3.10.4

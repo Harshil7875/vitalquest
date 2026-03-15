@@ -8,6 +8,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy shared contracts and service code (build context is repo root)
 COPY shared/ /app/shared/
 COPY health_service/ /app/health_service/
+COPY alembic.ini /app/alembic.ini
 
 ENV PYTHONPATH=/app
 
