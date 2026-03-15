@@ -43,6 +43,12 @@ class User(Base):
     guild_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Grace Protocol fields (v1.6)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    guild_status: Mapped[str] = mapped_column(
+        Enum("active", "resting", "kick_eligible", name="guild_member_status"),
+        default="active",
+    )
 
     goals: Mapped[list["UserGoal"]] = relationship("UserGoal", back_populates="user")
     biometric_logs: Mapped[list["BiometricLog"]] = relationship(
@@ -143,3 +149,82 @@ class DeletionRequest(Base):
         Enum("pending", "processing", "completed", name="deletion_status"),
         default="pending",
     )
+
+
+class OAuthToken(Base):
+    """
+    Stores OAuth 2.0 tokens for cloud-to-cloud device integrations (Dexcom, Oura, Fitbit).
+    Tokens are encrypted at rest. The refresh_token is used to rotate access_tokens
+    before they expire via the oauth_token_rotation cron job.
+    """
+
+    __tablename__ = "oauth_tokens"
+    __table_args__ = (UniqueConstraint("user_id", "provider", name="uq_user_provider"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    provider: Mapped[str] = mapped_column(
+        Enum("dexcom", "oura", "fitbit", "withings", name="oauth_provider"), nullable=False
+    )
+    access_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    scope: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class DeviceToken(Base):
+    """
+    Push notification device tokens (APNs/FCM).
+    Stored in health_service Postgres — not game_service — to stay within the PHI boundary
+    (device tokens are PII). The notification_worker reads these via the Redis queue,
+    never directly from this table.
+    """
+
+    __tablename__ = "device_tokens"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
+    token: Mapped[str] = mapped_column(String(512), nullable=False)
+    platform: Mapped[str] = mapped_column(
+        Enum("apns", "fcm", name="device_platform"), nullable=False
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class DeadLetterPayload(Base):
+    """
+    Failed webhook/adapter payloads quarantined for engineering review.
+    Ensures no patient data is permanently lost due to a parsing error.
+    """
+
+    __tablename__ = "dead_letter_payloads"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_body_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    failed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    error_message: Mapped[str] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class Guild(Base):
+    """
+    Guild membership authority. Only the health_service knows which users
+    belong to which guild (for nightly aggregation). The game_service
+    references guild_id as an opaque integer.
+    """
+
+    __tablename__ = "guilds"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    invite_code: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)
+    created_by_user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("users.id"), nullable=False
+    )
+    member_cap: Mapped[int] = mapped_column(Integer, default=50)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)

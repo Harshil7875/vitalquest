@@ -1,7 +1,8 @@
 """
 Game Service — FastAPI Application
 
-Handles game state queries and processes reward events from the Health Service.
+Handles game state queries, economy actions, guild management,
+and processes reward events from the Health Service.
 This service has NO access to the PostgreSQL Health Vault.
 All state is stored in Redis.
 """
@@ -13,13 +14,19 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from game_service.api.actions import router as actions_router
 from game_service.api.game import router as game_router
+from game_service.api.guilds import router as guilds_router
+from game_service.core.game_config import load_config
 from game_service.subscriber.redis_subscriber import start_subscriber
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Start the Redis subscriber as a background task
+    # Load master game config once at startup
+    load_config()
+
+    # Start the Redis reward subscriber as a background task
     subscriber_task = asyncio.create_task(start_subscriber())
     yield
     subscriber_task.cancel()
@@ -31,9 +38,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="VitalQuest — Game Service",
-    version="1.0.0",
+    version="1.5.0",
     description=(
-        "Game state management and reward processing. "
+        "Server-authoritative game state, economy actions, and guild management. "
         "Receives anonymized reward events from the Health Service via Redis Pub/Sub. "
         "No PHI is stored or accessible here."
     ),
@@ -41,6 +48,8 @@ app = FastAPI(
 )
 
 app.include_router(game_router)
+app.include_router(actions_router)
+app.include_router(guilds_router)
 
 
 @app.get("/health")

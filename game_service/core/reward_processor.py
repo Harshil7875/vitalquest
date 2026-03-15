@@ -27,8 +27,8 @@ from shared.schemas import GuildDamageEvent, RewardEvent
 
 logger = logging.getLogger(__name__)
 
-# Mirror of health_service daily cap — second line of defense
-DAILY_MANA_CAP = 500  # loaded from env in production via config
+# Mirror of health_service daily cap — second line of defense (GDD v1.8)
+DAILY_MANA_CAP = 300  # medication=100, steps=50, diet=25 per day max
 
 
 async def process_reward_event(event: RewardEvent, redis: aioredis.Redis) -> None:
@@ -90,16 +90,15 @@ async def _handle_mana_award(event: RewardEvent, redis: aioredis.Redis) -> None:
 
 
 async def _handle_guild_damage(event: RewardEvent, redis: aioredis.Redis) -> None:
-    guild_event = event  # event_type is guild_damage
-    guild_id = getattr(guild_event, "guild_id", None)
+    from game_service.core.raid_manager import apply_guild_damage, distribute_victory_loot
+
+    guild_id = getattr(event, "guild_id", None)
     if guild_id is None:
         logger.error("GuildDamageEvent missing guild_id: %s", event)
         return
 
-    new_total = await add_guild_damage(guild_id, event.amount)
-    logger.info(
-        "Guild %d dealt %d boss damage (daily total: %d)",
-        guild_id,
-        event.amount,
-        new_total,
-    )
+    boss_defeated = await apply_guild_damage(guild_id, event.amount, redis)
+    logger.info("Guild %d dealt %d boss damage (defeated=%s)", guild_id, event.amount, boss_defeated)
+
+    if boss_defeated:
+        await distribute_victory_loot(guild_id, redis)

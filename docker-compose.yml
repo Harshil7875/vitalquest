@@ -34,8 +34,8 @@ services:
 
   health_service:
     build:
-      context: ./health_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: health_service/Dockerfile
     restart: unless-stopped
     environment:
       POSTGRES_DSN: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
@@ -43,9 +43,16 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
-      DAILY_MANA_CAP: ${DAILY_MANA_CAP:-500}
+      DAILY_MANA_CAP: ${DAILY_MANA_CAP:-300}
       GUILD_CRON_HOUR: ${GUILD_CRON_HOUR:-23}
       GUILD_CRON_MINUTE: ${GUILD_CRON_MINUTE:-59}
+      DEXCOM_CLIENT_ID: ${DEXCOM_CLIENT_ID:-}
+      DEXCOM_CLIENT_SECRET: ${DEXCOM_CLIENT_SECRET:-}
+      DEXCOM_WEBHOOK_SECRET: ${DEXCOM_WEBHOOK_SECRET:-}
+      OURA_WEBHOOK_SECRET: ${OURA_WEBHOOK_SECRET:-}
+      FITBIT_WEBHOOK_SECRET: ${FITBIT_WEBHOOK_SECRET:-}
+      NOTIFICATION_QUEUE_HEALTH_KEY: ${NOTIFICATION_QUEUE_HEALTH_KEY:-notify:stream_a}
+      NOTIFICATION_QUEUE_GAME_KEY: ${NOTIFICATION_QUEUE_GAME_KEY:-notify:stream_b}
     depends_on:
       postgres:
         condition: service_healthy
@@ -53,19 +60,20 @@ services:
         condition: service_healthy
     networks:
       - health_net
-      - game_net  # health_service bridges both networks to publish reward events
+      - game_net
     expose:
       - "8000"
 
   game_service:
     build:
-      context: ./game_service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: game_service/Dockerfile
     restart: unless-stopped
     environment:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       JWT_SECRET: ${JWT_SECRET}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      NOTIFICATION_QUEUE_GAME_KEY: ${NOTIFICATION_QUEUE_GAME_KEY:-notify:stream_b}
       # Explicitly NO POSTGRES_DSN — game service cannot access PHI database
     depends_on:
       redis:
@@ -74,6 +82,31 @@ services:
       - game_net
     expose:
       - "8001"
+
+  notification_worker:
+    build:
+      context: .
+      dockerfile: notification_worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      APNS_KEY_PATH: ${APNS_KEY_PATH:-}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_BUNDLE_ID: ${APNS_BUNDLE_ID:-com.vitalquest.app}
+      APNS_USE_SANDBOX: ${APNS_USE_SANDBOX:-true}
+      FCM_SERVER_KEY: ${FCM_SERVER_KEY:-}
+      NOTIFICATION_QUEUE_HEALTH_KEY: ${NOTIFICATION_QUEUE_HEALTH_KEY:-notify:stream_a}
+      NOTIFICATION_QUEUE_GAME_KEY: ${NOTIFICATION_QUEUE_GAME_KEY:-notify:stream_b}
+      NOTIFICATION_DLQ_KEY: ${NOTIFICATION_DLQ_KEY:-notify:dlq}
+      MAX_RETRIES: ${NOTIFICATION_MAX_RETRIES:-3}
+      RETRY_BASE_DELAY_SECONDS: ${NOTIFICATION_RETRY_BASE_DELAY_S:-5}
+      # NO POSTGRES_DSN — notification worker only reads from Redis queue
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - game_net  # only needs Redis, which is on game_net
 
   nginx:
     image: nginx:1.25-alpine

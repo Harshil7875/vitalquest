@@ -27,6 +27,31 @@ REWARDS_CHANNEL = "health.rewards"
 _redis_client: aioredis.Redis | None = None
 
 
+async def enqueue_notification(job: "NotificationJob", device_token: str, platform: str) -> None:
+    """
+    Enqueues a push notification job to the appropriate Redis queue.
+    The notification_worker consumes from these queues asynchronously.
+
+    Stream A (health): health reminders — PHI-free trigger codes only.
+    Stream B (game): game engagement — rich title/body payloads.
+    """
+    from shared.schemas import NotificationJob
+
+    redis = await get_redis()
+    queue_key = (
+        settings.notification_queue_health_key
+        if job.stream == "health"
+        else settings.notification_queue_game_key
+    )
+    # Include device_token and platform in the queued payload
+    payload = job.model_dump()
+    payload["device_token"] = device_token
+    payload["platform"] = platform
+
+    import json
+    await redis.rpush(queue_key, json.dumps(payload))
+
+
 async def get_redis() -> aioredis.Redis:
     global _redis_client
     if _redis_client is None:

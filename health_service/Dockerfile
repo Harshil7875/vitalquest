@@ -2,13 +2,12 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install dependencies first for better layer caching
-COPY requirements.txt .
+COPY health_service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared contracts and service code
-COPY ../shared /app/shared
-COPY . /app/health_service
+# Copy shared contracts and service code (build context is repo root)
+COPY shared/ /app/shared/
+COPY health_service/ /app/health_service/
 
 ENV PYTHONPATH=/app
 

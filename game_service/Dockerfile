@@ -2,11 +2,11 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY game_service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY ../shared /app/shared
-COPY . /app/game_service
+COPY shared/ /app/shared/
+COPY game_service/ /app/game_service/
 
 ENV PYTHONPATH=/app
 

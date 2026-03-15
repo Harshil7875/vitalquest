@@ -1,0 +1,111 @@
+{
+  "_comment": "Master Game Config — changes require a deployment. This is the source of truth for all economy tuning.",
+
+  "economy": {
+    "daily_mana_cap": 300,
+    "mana_sources": {
+      "medication": 100,
+      "steps": 50,
+      "diet": 25,
+      "glucose": 25
+    },
+    "premium_currency": "astral_gems",
+    "guild_creation_cost_mana": 500
+  },
+
+  "avatar": {
+    "max_level": 50,
+    "stats": ["magic", "defense", "agility"],
+    "xp_per_level_base": 1000,
+    "xp_per_level_multiplier": 1.5,
+    "stat_points_per_level": 3
+  },
+
+  "sanctuary": {
+    "buildings": {
+      "apothecary": {
+        "display_name": "Apothecary",
+        "description": "Generates passive crafting materials over time.",
+        "max_tier": 5,
+        "tiers": {
+          "1": { "cost_mana": 500,   "cost_wood": 10,  "build_time_minutes": 30,  "requires": {} },
+          "2": { "cost_mana": 1500,  "cost_wood": 30,  "build_time_minutes": 120, "requires": { "apothecary": 1 } },
+          "3": { "cost_mana": 4000,  "cost_wood": 80,  "build_time_minutes": 480, "requires": { "apothecary": 2, "scout_tower": 1 } },
+          "4": { "cost_mana": 10000, "cost_wood": 200, "build_time_minutes": 1440, "requires": { "apothecary": 3, "healing_garden": 2 } },
+          "5": { "cost_mana": 25000, "cost_wood": 500, "build_time_minutes": 4320, "requires": { "apothecary": 4 } }
+        }
+      },
+      "scout_tower": {
+        "display_name": "Scout Tower",
+        "description": "Unlocks new weekly quests and raid targets.",
+        "max_tier": 5,
+        "tiers": {
+          "1": { "cost_mana": 300,  "cost_wood": 5,   "build_time_minutes": 15,  "requires": {} },
+          "2": { "cost_mana": 900,  "cost_wood": 15,  "build_time_minutes": 60,  "requires": { "scout_tower": 1 } },
+          "3": { "cost_mana": 2500, "cost_wood": 50,  "build_time_minutes": 240, "requires": { "scout_tower": 2 } },
+          "4": { "cost_mana": 7000, "cost_wood": 150, "build_time_minutes": 720, "requires": { "scout_tower": 3, "apothecary": 2 } },
+          "5": { "cost_mana": 18000, "cost_wood": 400, "build_time_minutes": 2880, "requires": { "scout_tower": 4 } }
+        }
+      },
+      "healing_garden": {
+        "display_name": "Healing Garden",
+        "description": "Grants passive HP regen buffs in guild raids.",
+        "max_tier": 5,
+        "tiers": {
+          "1": { "cost_mana": 200,  "cost_stone": 5,  "build_time_minutes": 10,  "requires": {} },
+          "2": { "cost_mana": 700,  "cost_stone": 20, "build_time_minutes": 45,  "requires": { "healing_garden": 1 } },
+          "3": { "cost_mana": 2000, "cost_stone": 60, "build_time_minutes": 180, "requires": { "healing_garden": 2, "apothecary": 1 } },
+          "4": { "cost_mana": 6000, "cost_stone": 180, "build_time_minutes": 600, "requires": { "healing_garden": 3 } },
+          "5": { "cost_mana": 15000, "cost_stone": 450, "build_time_minutes": 2400, "requires": { "healing_garden": 4, "scout_tower": 3 } }
+        }
+      },
+      "mana_well": {
+        "display_name": "Mana Well",
+        "description": "Increases the daily Mana cap bonus from guild buffs.",
+        "max_tier": 3,
+        "tiers": {
+          "1": { "cost_mana": 1000, "cost_stone": 30, "build_time_minutes": 60,  "requires": { "apothecary": 1 } },
+          "2": { "cost_mana": 4000, "cost_stone": 100, "build_time_minutes": 360, "requires": { "mana_well": 1, "healing_garden": 2 } },
+          "3": { "cost_mana": 12000, "cost_stone": 300, "build_time_minutes": 1440, "requires": { "mana_well": 2, "apothecary": 3 } }
+        }
+      }
+    }
+  },
+
+  "world_boss": {
+    "boss_hp": 100000,
+    "spawn_day_of_week": "wednesday",
+    "raid_duration_days": 7,
+    "victory_loot_chest_rarity": "epic"
+  },
+
+  "loot_chests": {
+    "common": {
+      "drop_table": [
+        { "item_id": "wood_small",   "quantity": 10, "weight": 60 },
+        { "item_id": "stone_small",  "quantity": 5,  "weight": 25 },
+        { "item_id": "gem_shard",    "quantity": 1,  "weight": 15 }
+      ]
+    },
+    "rare": {
+      "drop_table": [
+        { "item_id": "wood_bundle",  "quantity": 50, "weight": 40 },
+        { "item_id": "stone_bundle", "quantity": 25, "weight": 30 },
+        { "item_id": "iron_ingot",   "quantity": 5,  "weight": 20 },
+        { "item_id": "gem_shard",    "quantity": 3,  "weight": 10 }
+      ]
+    },
+    "epic": {
+      "drop_table": [
+        { "item_id": "iron_ingot",      "quantity": 20, "weight": 35 },
+        { "item_id": "astral_fragment", "quantity": 1,  "weight": 35 },
+        { "item_id": "avatar_skin_token", "quantity": 1, "weight": 20 },
+        { "item_id": "gem_chest_small", "quantity": 5,  "weight": 10 }
+      ]
+    }
+  },
+
+  "skip_timer": {
+    "cost_astral_gems_per_hour": 2
+  }
+}
