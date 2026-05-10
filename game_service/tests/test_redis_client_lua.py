@@ -97,7 +97,10 @@ class TestSetBuildTimerLua:
         )
         assert result == 1500
 
-    async def test_calls_correct_script_with_two_keys(self, stub_runner):
+    async def test_calls_correct_script_with_four_keys(self, stub_runner):
+        # Phase 9d expanded the KEYS layout from 2 to 4 — sanctuary and
+        # techtree keys are now passed in so prereq validation can happen
+        # inside the Lua atomically.
         stub_runner.queue(True, 0)
         await redis_client.set_build_timer_lua(
             user_id=42,
@@ -110,7 +113,12 @@ class TestSetBuildTimerLua:
         )
         name, keys, args = stub_runner.calls[0]
         assert name == "build_timer_set"
-        assert keys == ["game:state:42", "game:builds:42"]
+        assert keys == [
+            "game:state:42",
+            "game:builds:42",
+            "game:sanctuary:42",
+            "techtree:apothecary:tier:2",
+        ]
         assert args == [500, "apothecary", 1_800_000_000, 2, "idem-5"]
 
     async def test_insufficient_mana_returns_string(self, stub_runner):

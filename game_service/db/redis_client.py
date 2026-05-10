@@ -116,16 +116,26 @@ async def set_build_timer_lua(
     redis: aioredis.Redis | None = None,
 ) -> int | str:
     """
-    Atomically debits Mana and sets the build timer. Returns new balance (int)
-    or an error token (str). See `debit_mana_lua` for context on the
-    Phase 4 rewrite.
+    Atomically validates tech-tree prereqs, debits Mana, and sets the build
+    timer. Returns new balance (int) or an error token (str).
+
+    Phase 9d / fix #22 — prereq validation is now INSIDE the Lua, reading
+    techtree:{building_id}:tier:{N} hashes seeded by sync_to_redis at boot.
+    Previously can_upgrade() ran in Python before the Lua call, leaving a
+    TOCTOU window where a concurrent skip_build_timer could change
+    sanctuary tiers between the check and the debit.
     """
     if redis is None:
         redis = await get_redis()
     ok, value = await lua_runner.run(
         redis,
         "build_timer_set",
-        keys=[f"game:state:{user_id}", f"game:builds:{user_id}"],
+        keys=[
+            f"game:state:{user_id}",
+            f"game:builds:{user_id}",
+            f"game:sanctuary:{user_id}",
+            f"techtree:{building_id}:tier:{next_tier}",
+        ],
         args=[mana_cost, building_id, complete_at_unix, next_tier, idempotency_key],
     )
     return value
