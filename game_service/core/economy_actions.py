@@ -11,12 +11,14 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import redis.asyncio as aioredis
 
 from game_service.core.game_config import get_skip_timer_cost_gems_per_hour
 from game_service.core.loot import ItemGrant, calculate_skip_timer_cost, roll_chest
 from game_service.core.tech_tree import can_upgrade
+from game_service.db.lua_runner import runner as lua_runner
 from game_service.db.redis_client import (
     debit_mana_lua,
     get_build_timers,
@@ -112,7 +114,13 @@ async def skip_build_timer(
 ) -> ActionResult:
     """
     Pays Astral Gems to immediately complete a build timer.
-    Astral Gems are stored in game:state:{user_id}.astral_gems.
+
+    Phase 9a / fix #13 — atomic via skip_timer.lua. The previous version was
+    four sequential commands and ignored the idempotency_key, so retries
+    double-charged gems and a crash mid-sequence corrupted state (gems gone
+    but tier not promoted, or tier promoted but timer not cleared blocking
+    the next upgrade). The Lua does idempotency-check + gem-debit + tier-
+    promote + timer-clear in one block.
     """
     timers = await get_build_timers(user_id)
     complete_at_key = f"{building_id}:complete_at"
@@ -124,34 +132,44 @@ async def skip_build_timer(
     complete_at = int(timers[complete_at_key])
     remaining_minutes = max(0, (complete_at - int(time.time())) // 60)
     gem_cost = calculate_skip_timer_cost(remaining_minutes)
+    next_tier = int(timers.get(tier_key, 1))
 
-    raw_state = await get_game_state(user_id)
-    gem_balance = int(raw_state.get("astral_gems", 0))
+    ok, value = await lua_runner.run(
+        redis,
+        "skip_timer",
+        keys=[
+            f"game:state:{user_id}",
+            f"game:builds:{user_id}",
+            f"game:sanctuary:{user_id}",
+        ],
+        args=[building_id, gem_cost, next_tier, idempotency_key],
+    )
 
-    if gem_balance < gem_cost:
+    if not ok:
+        # Translate Lua error tokens to user-facing messages.
+        message_map = {
+            "DUPLICATE_REQUEST": "Skip timer already processed.",
+            "INSUFFICIENT_GEMS": f"Insufficient Astral Gems: need {gem_cost}.",
+            "TIMER_NOT_ACTIVE": "No active build timer for this building.",
+        }
         return ActionResult(
-            success=False,
-            message=f"Insufficient Astral Gems: need {gem_cost}, have {gem_balance}.",
+            success=False, message=message_map.get(value, value),
         )
 
-    # Deduct gems and finalize build
-    await redis.hincrby(f"game:state:{user_id}", "astral_gems", -gem_cost)
-    await redis.hdel(f"game:builds:{user_id}", complete_at_key)
-
-    next_tier = int(timers.get(tier_key, 1))
-    sanctuary_key = f"game:sanctuary:{user_id}"
-    await redis.hset(sanctuary_key, building_id, next_tier)
-    await redis.hdel(f"game:builds:{user_id}", tier_key)
-
+    new_gem_balance, applied_tier = value
+    raw_state = await get_game_state(user_id)
     logger.info(
         "user_id=%d skipped timer for %s tier %d, spent %d Astral Gems",
-        user_id, building_id, next_tier, gem_cost,
+        user_id, building_id, applied_tier, gem_cost,
     )
     return ActionResult(
         success=True,
-        message=f"{building_id} upgraded to tier {next_tier} instantly.",
+        message=f"{building_id} upgraded to tier {applied_tier} instantly.",
         new_mana_balance=int(raw_state.get("mana_balance", 0)),
     )
+
+
+CHEST_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days
 
 
 async def open_chest(
@@ -161,32 +179,61 @@ async def open_chest(
     redis: aioredis.Redis,
 ) -> ActionResult:
     """
-    Opens a loot chest. Deducts the chest from inventory, rolls loot server-side,
-    deposits items. The client has no influence over what drops.
-    """
-    inventory_key = f"game:inventory:{user_id}:chests"
-    chest_count = int(await redis.hget(inventory_key, chest_rarity) or 0)
+    Opens a loot chest. Server-authoritative: client never sees the roll
+    until the server commits.
 
-    if chest_count <= 0:
+    Phase 9b / fix #14: atomic via open_chest.lua. The previous version
+    had four sequential commands and no idempotency_key check, so a crash
+    mid-deposit lost items and double-clicks double-spent chests. The
+    rolled items are now persisted under `chest_result:{idempotency_key}`
+    with a 7-day TTL — a retried request returns the same items (not a
+    fresh roll).
+    """
+    result_key = f"chest_result:{idempotency_key}"
+
+    # Idempotent replay: if the result was already persisted, return it
+    # without rerolling. Covers the case where the original response
+    # didn't reach the client (network drop) but the server committed.
+    persisted = await redis.get(result_key)
+    if persisted is not None:
+        items = _deserialize_items(persisted)
+        raw_state = await get_game_state(user_id)
         return ActionResult(
-            success=False,
-            message=f"No {chest_rarity} chests in inventory.",
+            success=True,
+            message="Chest opened (replay).",
+            new_mana_balance=int(raw_state.get("mana_balance", 0)),
+            items_granted=items,
         )
 
-    # Deduct chest atomically
-    new_count = await redis.hincrby(inventory_key, chest_rarity, -1)
-    if new_count < 0:
-        # Race condition guard: restore if someone else took the last chest
-        await redis.hincrby(inventory_key, chest_rarity, 1)
-        return ActionResult(success=False, message="Chest no longer available.")
-
-    # Roll loot (server-side, cryptographic RNG)
+    # Roll loot in Python — Lua isn't a good RNG home and we want
+    # secrets.SystemRandom backing the RNG.
     items = roll_chest(chest_rarity)
+    payload = _serialize_items(items)
 
-    # Deposit items into inventory
-    item_inventory_key = f"game:inventory:{user_id}:items"
+    # Build the flat ARGV pairs the Lua expects: (item_id, qty, ...).
+    item_args: list[Any] = []
     for item in items:
-        await redis.hincrby(item_inventory_key, item.item_id, item.quantity)
+        item_args.extend([item.item_id, item.quantity])
+
+    ok, value = await lua_runner.run(
+        redis,
+        "open_chest",
+        keys=[
+            f"game:inventory:{user_id}:chests",
+            f"game:inventory:{user_id}:items",
+            result_key,
+        ],
+        args=[chest_rarity, idempotency_key, payload, CHEST_RESULT_TTL_SECONDS, *item_args],
+    )
+
+    if not ok:
+        message_map = {
+            "DUPLICATE_REQUEST": "Chest already opened.",
+            "CHEST_EMPTY": f"No {chest_rarity} chests in inventory.",
+        }
+        return ActionResult(
+            success=False, message=message_map.get(value, value),
+        )
 
     raw_state = await get_game_state(user_id)
     logger.info(
@@ -199,3 +246,15 @@ async def open_chest(
         new_mana_balance=int(raw_state.get("mana_balance", 0)),
         items_granted=items,
     )
+
+
+def _serialize_items(items: list[ItemGrant]) -> str:
+    """JSON-encode rolled items for persistence under chest_result:{idem_key}."""
+    import json
+    return json.dumps([{"item_id": i.item_id, "quantity": i.quantity} for i in items])
+
+
+def _deserialize_items(payload: str) -> list[ItemGrant]:
+    import json
+    raw = json.loads(payload)
+    return [ItemGrant(item_id=r["item_id"], quantity=r["quantity"]) for r in raw]

@@ -1,9 +1,12 @@
 """
-Queue Consumer
+Queue Consumer with at-least-once durability.
 
-Uses Redis BLPOP to pull NotificationJobs from the two queues (Stream A health,
-Stream B game). Dispatches to the push notification provider. Retries with
-exponential backoff on failure. Moves permanently failed jobs to a DLQ.
+Phase 12 / fix #11 — switched from BLPOP (destructively dequeues into
+worker memory; SIGKILL/OOM during retry loses the job permanently) to
+BLMOVE-into-processing-list (job stays in Redis under a per-worker key
+until success or DLQ). On worker startup, any jobs left in the processing
+list from a prior crash are moved back into the head of the main queue
+and replayed.
 """
 
 from __future__ import annotations
@@ -20,23 +23,80 @@ from shared.schemas import NotificationJob
 
 logger = logging.getLogger(__name__)
 
+# Per-worker processing list. We use a constant suffix today (single worker
+# per queue), but a future multi-worker deployment can rotate the consumer
+# id into this name to avoid two workers sharing one processing list.
+PROCESSING_SUFFIX = ":processing"
+
+
+def processing_key(queue_key: str) -> str:
+    return f"{queue_key}{PROCESSING_SUFFIX}"
+
+
+async def replay_stranded_jobs(redis: aioredis.Redis, queue_key: str) -> int:
+    """
+    Drain the processing list back to the head of the main queue.
+
+    Called once at consumer boot. Any jobs left here belong to a previous
+    worker that died mid-processing — moving them back to the queue replays
+    them on the new consumer.
+
+    Uses non-blocking LMOVE so this returns quickly if the list is empty.
+    """
+    proc_key = processing_key(queue_key)
+    moved = 0
+    while True:
+        # LMOVE proc_key queue_key RIGHT LEFT
+        # → pop from RIGHT of proc list (oldest pending), push to LEFT of
+        # main queue (re-deliver next).
+        res = await redis.lmove(proc_key, queue_key, src="RIGHT", dest="LEFT")
+        if res is None:
+            break
+        moved += 1
+    if moved:
+        logger.warning(
+            "Replayed %d stranded notification jobs from %s back into %s.",
+            moved, proc_key, queue_key,
+        )
+    return moved
+
 
 async def consume_stream(redis: aioredis.Redis, queue_key: str) -> None:
     """
     Long-running consumer coroutine for one queue.
-    BLPOP blocks until a job is available, then dispatches it.
+
+    BLMOVE atomically pops from the queue into the per-worker processing
+    list, so a SIGKILL/OOM between the move and the dispatch leaves the
+    job in the processing list — picked back up by replay_stranded_jobs
+    on the next worker boot.
+
     Auto-reconnects on connection loss.
     """
     logger.info("Consumer starting on queue '%s'.", queue_key)
 
+    # Recover any jobs left in flight by a prior worker process.
+    await replay_stranded_jobs(redis, queue_key)
+
+    proc_key = processing_key(queue_key)
+
     while True:
         try:
-            result = await redis.blpop(queue_key, timeout=30)
-            if result is None:
+            # BLMOVE blocks until a job is available; atomically moves it
+            # from the queue's LEFT (head) to processing's RIGHT (tail).
+            raw = await redis.blmove(
+                queue_key, proc_key, timeout=30, src="LEFT", dest="RIGHT",
+            )
+            if raw is None:
                 continue  # timeout, loop again
 
-            _, raw = result
-            await _process_job(raw, redis)
+            try:
+                await _process_job(raw, redis)
+            finally:
+                # Whether dispatch succeeded or DLQ'd, the job is no longer
+                # in flight in this worker. Remove it from the processing
+                # list. LREM count=1 strips exactly one matching entry —
+                # if duplicates ever exist, we only clear our own.
+                await redis.lrem(proc_key, 1, raw)
 
         except asyncio.CancelledError:
             return
@@ -49,7 +109,13 @@ async def consume_stream(redis: aioredis.Redis, queue_key: str) -> None:
 
 
 async def _process_job(raw: str, redis: aioredis.Redis) -> None:
-    """Deserializes a job, fetches the device token, and dispatches with retries."""
+    """Deserializes a job, fetches the device token, and dispatches with retries.
+
+    On permanent failure (max_retries exceeded or deserialization error), the
+    job moves to the DLQ. The caller in consume_stream LREM's it from the
+    processing list whether we succeed or DLQ — either outcome is "no
+    longer in flight."
+    """
     try:
         data = json.loads(raw)
         job = NotificationJob(**data)
@@ -58,8 +124,6 @@ async def _process_job(raw: str, redis: aioredis.Redis) -> None:
         await _to_dlq(raw, "deserialization_error", redis)
         return
 
-    # Device token is embedded in the queue payload (not fetched from DB here)
-    # The health_service includes it when enqueueing to avoid cross-service DB reads
     device_token = data.get("device_token", "")
     platform = data.get("platform", "apns")
 

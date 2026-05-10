@@ -17,7 +17,9 @@ from fastapi import FastAPI
 from game_service.api.actions import router as actions_router
 from game_service.api.game import router as game_router
 from game_service.api.guilds import router as guilds_router
-from game_service.core.game_config import load_config
+from game_service.core.game_config import load_config, sync_to_redis
+from game_service.db.lua_runner import register_default_scripts
+from game_service.db.redis_client import get_redis
 from game_service.subscriber.redis_subscriber import start_subscriber
 
 
@@ -25,6 +27,14 @@ from game_service.subscriber.redis_subscriber import start_subscriber
 async def lifespan(app: FastAPI):
     # Load master game config once at startup
     load_config()
+
+    # Push config keys (daily Mana cap, world boss HP, tech-tree prereqs) into
+    # Redis so Lua scripts can read them without re-marshalling JSON per call.
+    redis = await get_redis()
+    await sync_to_redis(redis)
+
+    # Register all .lua scripts so EVALSHA paths are warm before the first request.
+    register_default_scripts()
 
     # Start the Redis reward subscriber as a background task
     subscriber_task = asyncio.create_task(start_subscriber())

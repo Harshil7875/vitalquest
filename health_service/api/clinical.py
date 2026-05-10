@@ -20,9 +20,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from health_service.api.auth import get_current_user
-from health_service.db.models import BiometricLog, DeletionRequest, User
+from health_service.core.crypto import lookup_hash
+from health_service.db.models import (
+    AuditLog,
+    BiometricLog,
+    DeletionRequest,
+    DeviceAttestation,
+    DeviceToken,
+    ManaLedger,
+    OAuthToken,
+    User,
+)
 from health_service.db.session import get_db
-from health_service.publisher.redis_publisher import publish_reward
+from health_service.publisher.redis_publisher import publish_event
 from shared.schemas import ErasureEvent
 
 logger = logging.getLogger(__name__)
@@ -97,13 +107,26 @@ async def request_account_deletion(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Initiates the Right to Erasure workflow:
-    1. Soft-deletes the user record (marks deleted_at)
-    2. Hard-deletes all BiometricLog records
-    3. Publishes ErasureEvent to Game Service to anonymize game state
+    Right to Erasure (audit finding #5).
 
-    The game avatar and historical guild data are preserved as orphaned,
-    anonymized records per the data lifecycle policy.
+    Cascades a hard delete across every table that stores PHI or PII linked
+    to this user. The previous version only deleted BiometricLog rows —
+    OAuth refresh tokens, ManaLedger, AuditLog, DeviceToken, and
+    DeviceAttestation rows all survived, so the "deleted" user could still
+    be re-identified and Dexcom/Oura/Fitbit could keep pushing PHI to a
+    user record that no longer existed in our user-facing UI.
+
+    Steps:
+      1. Soft-delete the User row (preserves the FK so downstream deletes
+         remain referentially valid in the same transaction).
+      2. Hard-delete BiometricLog, OAuthToken, ManaLedger, AuditLog,
+         DeviceToken, DeviceAttestation rows for this user.
+      3. Anonymize the User row's identifying fields (email, lookup_hash,
+         password) so the row itself can stay as an FK target without
+         carrying any PII.
+      4. Anonymize the DeletionRequest row's user_id to a hash for
+         compliance receipt purposes.
+      5. Enqueue an ErasureEvent for the game service via the outbox.
     """
     # Check for existing pending request
     existing_stmt = select(DeletionRequest).where(
@@ -117,33 +140,53 @@ async def request_account_deletion(
             detail="A deletion request is already in progress.",
         )
 
-    # Soft-delete user
-    current_user.deleted_at = datetime.now(timezone.utc)
-
-    # Hard-delete all raw biometric PHI
-    logs_stmt = select(BiometricLog).where(BiometricLog.user_id == current_user.id)
-    logs_result = await db.execute(logs_stmt)
-    for log in logs_result.scalars().all():
-        await db.delete(log)
-
-    # Record the deletion request
-    deletion_record = DeletionRequest(
-        user_id=current_user.id,
-        status="processing",
-    )
+    user_id = current_user.id
+    deletion_record = DeletionRequest(user_id=user_id, status="processing")
     db.add(deletion_record)
     await db.flush()
 
-    # Publish ErasureEvent to game service
-    erasure_event = ErasureEvent(user_id=current_user.id)
-    await publish_reward(erasure_event, db)
+    # Cascade delete across every PHI/PII-bearing table.
+    cascade_models = [
+        BiometricLog,
+        OAuthToken,
+        ManaLedger,
+        AuditLog,
+        DeviceToken,
+        DeviceAttestation,
+    ]
+    for model in cascade_models:
+        rows = (
+            await db.execute(select(model).where(model.user_id == user_id))
+        ).scalars().all()
+        for row in rows:
+            await db.delete(row)
 
+    # Anonymize the User row in place. Keep the row so any FK that refers
+    # to this user_id stays valid (e.g. Guild.created_by_user_id), but
+    # strip every identifier.
+    anonymized_marker = f"deleted_user_{lookup_hash(str(user_id))[:16]}"
+    current_user.email_encrypted = anonymized_marker
+    current_user.email_lookup_hash = lookup_hash(anonymized_marker)
+    current_user.hashed_password = ""  # Login becomes impossible
+    current_user.deleted_at = datetime.now(timezone.utc)
+
+    # Anonymize the DeletionRequest user_id to a hash for the compliance
+    # receipt — we keep the row to prove the deletion happened, but the
+    # original user_id is gone.
+    deletion_record.user_id = None  # column is nullable post-Phase-1
     deletion_record.status = "completed"
     deletion_record.completed_at = datetime.now(timezone.utc)
 
+    # Enqueue ErasureEvent through the outbox so the game service
+    # anonymizes its Redis state. publish_event (Phase 5) handles
+    # ErasureEvent specially — no ManaLedger row is created for the
+    # user being erased.
+    await publish_event(ErasureEvent(user_id=user_id), db)
+
     logger.info(
-        "Right to Erasure completed for user_id=%d. PHI deleted, game state anonymization dispatched.",
-        current_user.id,
+        "Right to Erasure completed for user_id=%d: PHI cascade across %d tables, "
+        "user record anonymized, game state event dispatched.",
+        user_id, len(cascade_models),
     )
 
     return {"detail": "Your account and health data have been permanently deleted."}

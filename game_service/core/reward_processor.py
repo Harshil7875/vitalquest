@@ -4,39 +4,56 @@ Reward Processor
 Applies incoming RewardEvents from the Health Service to the game state.
 This is the only mutating logic in the game service.
 
-All state changes are idempotent — duplicate events with the same
-idempotency_key are silently dropped.
+Phase 7 / fixes #9, #15, #23:
+- Idempotency for ALL event types is now an atomic SADD-and-branch on
+  `game:processed_events`. The previous `is_event_processed → handler →
+  mark_event_processed` pattern was a TOCTOU race: two parallel deliveries
+  of the same event both passed the SISMEMBER check and double-applied.
+- Mana awards run through `reward_apply.lua` so the cap-check + credit +
+  counter-increment are a single atomic operation, fixing the
+  GET-then-INCR race the audit flagged.
+- The hardcoded `DAILY_MANA_CAP = 300` constant is gone. Cap is read via
+  `game_config.get_daily_mana_cap()` so master_config.json stays the
+  single source of truth.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import date, timedelta
 
 import redis.asyncio as aioredis
 
 from game_service.core.erasure_handler import anonymize_user
+from game_service.core.game_config import get_daily_mana_cap
+from game_service.db.lua_runner import runner as lua_runner
 from game_service.db.redis_client import (
-    add_guild_damage,
-    get_daily_cap_counter,
-    increment_daily_cap,
-    increment_mana,
-    is_event_processed,
-    mark_event_processed,
+    PROCESSED_EVENTS_KEY,
+    get_redis,
 )
 from shared.schemas import GuildDamageEvent, RewardEvent
 
 logger = logging.getLogger(__name__)
 
-# Mirror of health_service daily cap — second line of defense (GDD v1.8)
-DAILY_MANA_CAP = 300  # medication=100, steps=50, diet=25 per day max
+DAILY_COUNTER_TTL_SECONDS = int(timedelta(hours=25).total_seconds())
 
 
 async def process_reward_event(event: RewardEvent, redis: aioredis.Redis) -> None:
     """
-    Dispatches a RewardEvent to the appropriate handler.
-    Idempotency check prevents double-processing on subscriber retry.
+    Applies a RewardEvent. Atomic-idempotent: a duplicate event with the
+    same idempotency_key is a single Redis SADD that returns 0 and exits.
+
+    All exceptions are caught so the subscriber loop never dies on a single
+    bad event. We do NOT undo the SADD on failure — that's intentional
+    at-most-once semantics. Each handler below either fully succeeds (atomic
+    Lua) or has logically-idempotent state changes (anonymize_user is a
+    HDEL/SET sweep that's safe to repeat).
     """
-    if await is_event_processed(event.idempotency_key):
+    # Atomic SADD: returns 1 if newly added, 0 if already present. The
+    # entire idempotency check + mark is one Redis op, so two concurrent
+    # deliveries of the same event will see exactly one is_new=1.
+    is_new = await redis.sadd(PROCESSED_EVENTS_KEY, event.idempotency_key)
+    if not is_new:
         logger.debug("Skipping already-processed event %s", event.idempotency_key)
         return
 
@@ -49,44 +66,49 @@ async def process_reward_event(event: RewardEvent, redis: aioredis.Redis) -> Non
             await anonymize_user(event.user_id, redis)
         else:
             logger.warning("Unknown event_type '%s', skipping.", event.event_type)
-            return
-
-        await mark_event_processed(event.idempotency_key)
-
     except Exception:
         logger.exception(
-            "Failed to process event %s (type=%s, user=%d)",
-            event.idempotency_key,
-            event.event_type,
-            event.user_id,
+            "Failed to process event %s (type=%s, user=%d). State may be partially "
+            "applied; the event will NOT retry (idempotency key already marked).",
+            event.idempotency_key, event.event_type, event.user_id,
         )
-        # Do not re-raise — subscriber loop must not crash on a single bad event
 
 
 async def _handle_mana_award(event: RewardEvent, redis: aioredis.Redis) -> None:
-    # Second daily cap check at the game layer (defense in depth)
-    current_daily = await get_daily_cap_counter(event.user_id)
-    if current_daily >= DAILY_MANA_CAP:
-        logger.info(
-            "Daily Mana cap already reached for user_id=%d, dropping award of %d.",
-            event.user_id,
-            event.amount,
+    """
+    Atomic cap-and-credit via reward_apply.lua. The script returns
+    {new_balance, awarded} — `awarded == 0` means the daily cap was hit.
+    """
+    daily_cap = get_daily_mana_cap()
+    today = date.today().isoformat()
+    state_key = f"game:state:{event.user_id}"
+    daily_key = f"game:daily_cap:{event.user_id}:{today}"
+
+    ok, value = await lua_runner.run(
+        redis,
+        "reward_apply",
+        keys=[state_key, daily_key],
+        args=[event.amount, daily_cap, DAILY_COUNTER_TTL_SECONDS],
+    )
+    if not ok:
+        logger.error(
+            "reward_apply.lua returned error '%s' for user_id=%d",
+            value, event.user_id,
         )
         return
 
-    # Cap the award to not exceed the daily limit
-    amount_to_award = min(event.amount, DAILY_MANA_CAP - current_daily)
-
-    new_balance = await increment_mana(event.user_id, amount_to_award)
-    await increment_daily_cap(event.user_id, amount_to_award)
-
-    logger.info(
-        "Awarded %d Mana to user_id=%d (new balance: %d, source: %s)",
-        amount_to_award,
-        event.user_id,
-        new_balance,
-        event.source,
-    )
+    new_balance, awarded = value
+    if awarded == 0:
+        logger.info(
+            "Daily Mana cap (%d) already reached for user_id=%d; dropped award of %d.",
+            daily_cap, event.user_id, event.amount,
+        )
+    else:
+        logger.info(
+            "Awarded %d Mana to user_id=%d (new balance: %d, source: %s, "
+            "clamped from %d).",
+            awarded, event.user_id, new_balance, event.source, event.amount,
+        )
 
 
 async def _handle_guild_damage(event: RewardEvent, redis: aioredis.Redis) -> None:
@@ -98,7 +120,10 @@ async def _handle_guild_damage(event: RewardEvent, redis: aioredis.Redis) -> Non
         return
 
     boss_defeated = await apply_guild_damage(guild_id, event.amount, redis)
-    logger.info("Guild %d dealt %d boss damage (defeated=%s)", guild_id, event.amount, boss_defeated)
+    logger.info(
+        "Guild %d dealt %d boss damage (defeated=%s)",
+        guild_id, event.amount, boss_defeated,
+    )
 
     if boss_defeated:
         await distribute_victory_loot(guild_id, redis)

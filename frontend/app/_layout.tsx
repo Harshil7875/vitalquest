@@ -48,8 +48,10 @@ function RootLayoutInner() {
         <View style={styles.webAppColumn}>
           <Stack screenOptions={{ headerShown: false }} />
         </View>
-        {/* Dev Mock Panel fixed to the right */}
-        <DevMockPanel />
+        {/* Phase 13 / fix #7 — Dev Mock Panel is dev-only.
+           Native builds never see it (handled inside the component too) and
+           production web builds skip the render entirely. */}
+        {__DEV__ && <DevMockPanel />}
       </View>
     );
   }

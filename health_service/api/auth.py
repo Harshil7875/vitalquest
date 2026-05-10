@@ -16,6 +16,7 @@ from pydantic import BaseModel, EmailStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from health_service.core.crypto import lookup_hash
 from health_service.db.models import User
 from health_service.db.session import get_db
 from shared.jwt_utils import create_access_token, verify_token
@@ -68,8 +69,14 @@ async def get_current_user(
 
 @router.post("/register", response_model=TokenResponse, status_code=status.HTTP_201_CREATED)
 async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
-    # Check for existing email (stored encrypted — simplified here)
-    stmt = select(User).where(User.email_encrypted == body.email.lower())
+    # Email is stored encrypted at rest via the EncryptedString TypeDecorator
+    # on User.email_encrypted. Indexed equality lookups use the deterministic
+    # email_lookup_hash sidecar — every Fernet encryption is non-deterministic,
+    # so a UNIQUE on the ciphertext column never collides.
+    normalized_email = body.email.lower()
+    email_hash = lookup_hash(normalized_email)
+
+    stmt = select(User).where(User.email_lookup_hash == email_hash)
     existing = (await db.execute(stmt)).scalar_one_or_none()
     if existing:
         raise HTTPException(
@@ -78,7 +85,8 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
         )
 
     user = User(
-        email_encrypted=body.email.lower(),  # TODO: encrypt with ENCRYPTION_KEY
+        email_encrypted=normalized_email,  # TypeDecorator encrypts on bind.
+        email_lookup_hash=email_hash,
         hashed_password=pwd_context.hash(body.password),
         role="free",
     )
@@ -91,8 +99,9 @@ async def register(body: RegisterRequest, db: AsyncSession = Depends(get_db)):
 
 @router.post("/login", response_model=TokenResponse)
 async def login(body: LoginRequest, db: AsyncSession = Depends(get_db)):
+    email_hash = lookup_hash(body.email.lower())
     stmt = select(User).where(
-        User.email_encrypted == body.email.lower(),
+        User.email_lookup_hash == email_hash,
         User.deleted_at.is_(None),
     )
     user: User | None = (await db.execute(stmt)).scalar_one_or_none()

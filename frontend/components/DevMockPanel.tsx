@@ -71,7 +71,11 @@ export function DevMockPanel() {
   const [glucose, setGlucose] = useState(getMockStore().bloodGlucose);
   const [lastResult, setLastResult] = useState<string | null>(null);
 
-  if (Platform.OS !== 'web') return null;
+  // Phase 13 / fix #7 — never render in production builds, even on web.
+  // Without this gate the prod web bundle ships a panel that lets any
+  // visitor inject synthetic biometrics into the live backend, distorting
+  // the Mana economy and clinical sync state.
+  if (Platform.OS !== 'web' || !__DEV__) return null;
 
   const sync = async (payload: Omit<VitalQuestStandardPayload, 'idempotency_key' | 'recorded_at' | 'source'>) => {
     const full: VitalQuestStandardPayload = {

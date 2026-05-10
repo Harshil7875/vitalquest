@@ -69,10 +69,19 @@ class DexcomAdapter(BaseAdapter):
         """
         Dexcom signs webhook payloads with HMAC-SHA256 using our webhook secret.
         The signature is in the X-Dexcom-Signature header.
+
+        Fail-closed: if `dexcom_webhook_secret` is empty (audit finding #2),
+        the registry route() call will surface a clear error rather than
+        silently accept unsigned payloads. Pre-launch deployments that don't
+        yet have a Dexcom secret should leave `dexcom_client_id` empty too —
+        that branch is rejected upstream before this method is reached.
         """
         if not settings.dexcom_webhook_secret:
-            logger.warning("Dexcom webhook secret not configured — skipping signature check.")
-            return True
+            logger.error(
+                "Dexcom webhook secret is not configured — refusing to verify "
+                "this signature. Set DEXCOM_WEBHOOK_SECRET in the environment."
+            )
+            return False
 
         expected = hmac.new(
             settings.dexcom_webhook_secret.encode(),
@@ -158,6 +167,27 @@ async def exchange_code_for_tokens(code: str, redirect_uri: str) -> dict:
                 "grant_type": "authorization_code",
                 "redirect_uri": redirect_uri,
             },
+        )
+        response.raise_for_status()
+        return response.json()
+
+
+async def fetch_user_info(access_token: str) -> dict:
+    """
+    Fetch the authenticated user's Dexcom profile.
+
+    Used by the OAuth callback to populate OAuthToken.provider_user_id
+    (audit finding #1). Without this, webhook payloads cannot be reliably
+    routed back to the correct VitalQuest user.
+
+    Dexcom's V3 API returns a stable user identifier under the `userId` key.
+    """
+    import httpx
+    url = "https://api.dexcom.com/v3/users/self"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
         )
         response.raise_for_status()
         return response.json()

@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from game_service.api.game import get_current_user
 from game_service.core.chat_filter import filter_message
+from game_service.core.game_config import get_world_boss_hp
 from game_service.core.guild_manager import create_guild, join_guild, kick_member
 from game_service.db.redis_client import (
     get_chat_messages,
@@ -179,6 +180,6 @@ async def get_guild(
         guild_id=guild_id,
         name=state.get("name", "Unknown"),
         member_count=len(roster),
-        boss_hp_remaining=int(state.get("boss_hp_remaining", 100000)),
+        boss_hp_remaining=int(state.get("boss_hp_remaining", get_world_boss_hp())),
         invite_code=invite_code,
     )

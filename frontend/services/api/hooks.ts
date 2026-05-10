@@ -23,11 +23,26 @@ import type {
 } from '../../types';
 
 // ─── Query Keys ───────────────────────────────────────────────────────────────
+// Phase 13 / fix #8 — Keys that hold per-user data (gameState, clinicalExport)
+// are now FUNCTIONS scoped by userId, so two users on the same device never
+// see each other's cached data. invalidateQueries works against partial keys
+// (TanStack matches by prefix), so callers that don't have the userId can
+// still invalidate by passing ['gameState'] — but the actual cache entry is
+// keyed by [scope, userId] so reads only hit the current user's slot.
+
+import { useAuth } from '../../features/auth/useAuth';
 
 export const queryKeys = {
-  gameState: ['gameState'] as const,
+  gameState: (userId: string | null) => ['gameState', userId ?? 'anon'] as const,
   guildState: (guildId: string) => ['guild', guildId] as const,
   guildChat: (guildId: string) => ['guildChat', guildId] as const,
+  clinicalExport: (userId: string | null) =>
+    ['clinicalExport', userId ?? 'anon'] as const,
+};
+
+// Prefix-only keys for invalidateQueries — TanStack matches partial prefixes.
+const queryKeyPrefixes = {
+  gameState: ['gameState'] as const,
   clinicalExport: ['clinicalExport'] as const,
 };
 
@@ -53,16 +68,17 @@ export function useRegisterMutation() {
 
 export function useGameStateQuery(enabled = true) {
   const setGameState = useGameStore((s) => s.setGameState);
+  const { userId } = useAuth();
 
   return useQuery({
-    queryKey: queryKeys.gameState,
+    queryKey: queryKeys.gameState(userId),
     queryFn: async () => {
       const data = await apiClient.get<GameStateResponse>('/api/game/state');
       // Server is authoritative — overwrite optimistic local state
       setGameState(data);
       return data;
     },
-    enabled,
+    enabled: enabled && !!userId,
     staleTime: 30_000, // Treat as fresh for 30 s to avoid refetch storms
     refetchOnWindowFocus: true,
   });
@@ -87,7 +103,7 @@ export function useSyncHealthMutation() {
       if (data.status === 'ACCEPTED' && data.game_update) {
         optimisticAddMana(data.mana_awarded);
         // Invalidate so useGameStateQuery re-fetches the authoritative state
-        queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+        queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
       }
       setTodayProgress({
         currentSteps: payload.steps ?? 0,
@@ -141,7 +157,7 @@ export function useFlushOfflineQueue() {
         }
       }
       // Re-fetch authoritative game state after batch sync
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     } finally {
       unlockQueue();
     }
@@ -172,7 +188,7 @@ export function useUpgradeBuildingMutation() {
     onSuccess: (data) => {
       optimisticDeductMana(data.mana_spent);
       setBuilding(data.building);
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
 
     onError: (_err, _req, context) => {
@@ -180,7 +196,7 @@ export function useUpgradeBuildingMutation() {
       if (context?.prevBuilding) {
         setBuilding(context.prevBuilding);
       }
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
   });
 }
@@ -199,11 +215,11 @@ export function useSkipTimerMutation() {
     onSuccess: (data) => {
       optimisticDeductGems(data.gems_spent);
       setBuilding(data.building);
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
 
     onError: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
   });
 }
@@ -224,7 +240,7 @@ export function useOpenChestMutation() {
       if (data.reward_type === 'MANA') {
         optimisticAddMana(data.amount);
       }
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
   });
 }
@@ -280,7 +296,7 @@ export function useCreateGuildMutation() {
       apiClient.post<GuildState>('/api/game/guilds/create', { name }),
 
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
   });
 }
@@ -295,7 +311,7 @@ export function useJoinGuildMutation() {
       apiClient.post<GuildState>('/api/game/guilds/join', { invite_code }),
 
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.gameState });
+      queryClient.invalidateQueries({ queryKey: queryKeyPrefixes.gameState });
     },
   });
 }
@@ -305,10 +321,11 @@ export function useJoinGuildMutation() {
 // Only mounts inside the (clinical) route group after biometric auth.
 
 export function useExportClinicalQuery(enabled = false) {
+  const { userId } = useAuth();
   return useQuery({
-    queryKey: queryKeys.clinicalExport,
+    queryKey: queryKeys.clinicalExport(userId),
     queryFn: () => apiClient.get('/api/clinical/export'),
-    enabled,
+    enabled: enabled && !!userId,
     staleTime: Infinity, // Export is expensive — never auto-refetch
     retry: false,
   });
