@@ -18,11 +18,17 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from health_service.adapters.dexcom import exchange_code_for_tokens
+from health_service.adapters.dexcom import (
+    build_auth_url as dexcom_build_auth_url,
+    exchange_code_for_tokens,
+    fetch_user_info as dexcom_fetch_user_info,
+)
 from health_service.adapters.registry import route
 from health_service.api.auth import get_current_user
+from health_service.config import settings
 from health_service.core.anti_cheat import SyncPayload, run_pipeline
 from health_service.core.goal_evaluator import evaluate
+from health_service.core.oauth_state import mint_state, verify_state
 from health_service.db.models import (
     AuditLog,
     BiometricLog,
@@ -70,45 +76,93 @@ async def receive_webhook(
     return {"status": "accepted"}
 
 
+@router.get("/oauth/{provider}/start")
+async def oauth_start(
+    provider: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Mints a CSRF-protection nonce and returns the provider's authorization URL.
+
+    The mobile client calls this endpoint, then redirects the user to the
+    returned `authorize_url`. The callback handler verifies the `state` was
+    minted for this same user. Without this two-step flow, an attacker can
+    trick a logged-in victim into binding the attacker's provider account
+    (audit finding #3).
+    """
+    if provider not in _SUPPORTED_PROVIDERS:
+        raise HTTPException(status_code=404, detail=f"Unknown provider '{provider}'.")
+    if provider != "dexcom":
+        raise HTTPException(status_code=501, detail=f"OAuth for '{provider}' not yet implemented.")
+    if not settings.dexcom_client_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Dexcom OAuth is not configured on this deployment.",
+        )
+
+    nonce = await mint_state(current_user.id)
+    redirect_uri = _absolute_callback_url(request, provider)
+    authorize_url = dexcom_build_auth_url(redirect_uri=redirect_uri, state=nonce)
+    return {
+        "authorize_url": authorize_url,
+        "state": nonce,
+        "redirect_uri": redirect_uri,
+    }
+
+
 @router.get("/oauth/{provider}/callback")
 async def oauth_callback(
     provider: str,
     code: str,
     state: str,
+    request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """
-    Completes OAuth 2.0 flow. The mobile client initiates the OAuth dance;
-    on success, Dexcom redirects to this callback with an authorization code.
-    We exchange it for access + refresh tokens and store them encrypted.
+    Completes OAuth 2.0 flow. The mobile client initiates the OAuth dance via
+    /start; on success, the provider redirects here with an authorization code
+    and the state nonce. We verify the state, exchange the code for tokens,
+    fetch the provider's stable user identifier (so webhooks can resolve back
+    to this user — finding #1), and persist everything encrypted.
     """
     if provider not in _SUPPORTED_PROVIDERS:
         raise HTTPException(status_code=404, detail=f"Unknown provider '{provider}'.")
 
-    # Only Dexcom is fully implemented; others follow the same pattern
-    if provider == "dexcom":
-        token_data = await exchange_code_for_tokens(
-            code=code,
-            redirect_uri=f"/api/health/oauth/dexcom/callback",
+    # CSRF defense: state must have been minted by /start for THIS user (#3).
+    if not await verify_state(state, current_user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired OAuth state. Please retry the connection.",
         )
-    else:
-        raise HTTPException(status_code=501, detail=f"OAuth for '{provider}' not yet implemented.")
+
+    if provider != "dexcom":
+        raise HTTPException(
+            status_code=501, detail=f"OAuth for '{provider}' not yet implemented."
+        )
+
+    redirect_uri = _absolute_callback_url(request, provider)
+    token_data = await exchange_code_for_tokens(code=code, redirect_uri=redirect_uri)
+
+    # Real /userinfo lookup so OAuthToken.provider_user_id is populated with
+    # the provider's stable identifier — finding #1 depends on this. Without
+    # it, _resolve_user_id below cannot route webhooks correctly.
+    user_info = await dexcom_fetch_user_info(token_data["access_token"])
+    provider_user_id = str(user_info.get("userId") or user_info.get("id") or "")
+    if not provider_user_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Provider did not return a stable user identifier.",
+        )
 
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=token_data["expires_in"])
 
-    # Upsert the token record
     stmt = select(OAuthToken).where(
         OAuthToken.user_id == current_user.id,
         OAuthToken.provider == provider,
     )
     existing: OAuthToken | None = (await db.execute(stmt)).scalar_one_or_none()
-
-    # The provider_user_id (Dexcom's stable identifier for this patient) is
-    # required to resolve incoming webhooks back to this user — see
-    # _resolve_user_id below. Phase 2 (#1) replaces this placeholder with a
-    # real call to the provider's /userinfo endpoint.
-    provider_user_id = token_data.get("provider_user_id") or f"pending-{current_user.id}"
 
     # access_token / refresh_token are stored via EncryptedString TypeDecorator,
     # so assigning plaintext below produces ciphertext at rest automatically.
@@ -131,6 +185,18 @@ async def oauth_callback(
 
     logger.info("Stored OAuth token for user_id=%d, provider=%s", current_user.id, provider)
     return {"status": "connected", "provider": provider}
+
+
+def _absolute_callback_url(request: Request, provider: str) -> str:
+    """Build the absolute callback URL the provider will redirect to.
+
+    Dexcom rejects relative redirect_uri values (the prior bug at this site),
+    so we construct it from the request's scheme+host. In production this is
+    the public hostname behind the Nginx gateway; in dev it's localhost.
+    """
+    scheme = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.url.netloc
+    return f"{scheme}://{host}/api/health/oauth/{provider}/callback"
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────────
@@ -200,10 +266,19 @@ async def _process_adapter_payload(
 
 
 async def _resolve_user_id(provider: str, provider_user_id: str, db: AsyncSession) -> int | None:
-    """Map provider's user identifier back to our internal user_id via OAuthToken."""
-    # In production, store provider_user_id on OAuthToken at time of OAuth exchange
-    # For MVP, we do a simple lookup by provider
-    stmt = select(OAuthToken.user_id).where(OAuthToken.provider == provider)
+    """Map provider's stable user identifier back to our internal user_id.
+
+    Audit finding #1: the previous implementation returned the FIRST OAuthToken
+    row for the provider, so every webhook for that provider was attributed to
+    one (essentially random) victim. This now matches by `(provider, provider_user_id)`,
+    backed by the indexed UNIQUE constraint added in Phase 1.
+    """
+    if not provider_user_id:
+        return None
+    stmt = select(OAuthToken.user_id).where(
+        OAuthToken.provider == provider,
+        OAuthToken.provider_user_id == provider_user_id,
+    )
     result = await db.execute(stmt)
     row = result.first()
     return row[0] if row else None
