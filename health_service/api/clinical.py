@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from health_service.api.auth import get_current_user
@@ -90,7 +90,7 @@ async def export_clinical_data(
 
     return ExportResponse(
         user_id=current_user.id,
-        export_generated_at=datetime.now(timezone.utc),
+        export_generated_at=datetime.utcnow(),
         entries=entries,
         total_records=len(entries),
     )
@@ -146,6 +146,10 @@ async def request_account_deletion(
     await db.flush()
 
     # Cascade delete across every PHI/PII-bearing table.
+    # Bulk SQL DELETE — never materializes the ORM rows, so rows containing
+    # corrupted ciphertext (key rotation gone wrong, hardware corruption,
+    # etc.) don't block the erasure. Decrypting just to delete would also
+    # leak PHI to logs on failure.
     cascade_models = [
         BiometricLog,
         OAuthToken,
@@ -155,11 +159,7 @@ async def request_account_deletion(
         DeviceAttestation,
     ]
     for model in cascade_models:
-        rows = (
-            await db.execute(select(model).where(model.user_id == user_id))
-        ).scalars().all()
-        for row in rows:
-            await db.delete(row)
+        await db.execute(delete(model).where(model.user_id == user_id))
 
     # Anonymize the User row in place. Keep the row so any FK that refers
     # to this user_id stays valid (e.g. Guild.created_by_user_id), but
@@ -168,14 +168,14 @@ async def request_account_deletion(
     current_user.email_encrypted = anonymized_marker
     current_user.email_lookup_hash = lookup_hash(anonymized_marker)
     current_user.hashed_password = ""  # Login becomes impossible
-    current_user.deleted_at = datetime.now(timezone.utc)
+    current_user.deleted_at = datetime.utcnow()
 
     # Anonymize the DeletionRequest user_id to a hash for the compliance
     # receipt — we keep the row to prove the deletion happened, but the
     # original user_id is gone.
     deletion_record.user_id = None  # column is nullable post-Phase-1
     deletion_record.status = "completed"
-    deletion_record.completed_at = datetime.now(timezone.utc)
+    deletion_record.completed_at = datetime.utcnow()
 
     # Enqueue ErasureEvent through the outbox so the game service
     # anonymizes its Redis state. publish_event (Phase 5) handles

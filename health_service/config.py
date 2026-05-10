@@ -33,6 +33,11 @@ class Settings(BaseSettings):
 
     class Config:
         env_file = ".env"
+        # The .env file at the repo root is shared with docker-compose and
+        # contains keys this Settings class doesn't declare (POSTGRES_USER,
+        # POSTGRES_PASSWORD, REDIS_PASSWORD — used only to construct DSN
+        # strings in compose). Without this, pydantic-settings rejects them.
+        extra = "ignore"
 
 
 settings = Settings()
