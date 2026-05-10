@@ -13,6 +13,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import redis.asyncio as aioredis
+
 logger = logging.getLogger(__name__)
 
 _config: dict[str, Any] | None = None
@@ -60,3 +62,68 @@ def get_loot_table(rarity: str) -> list[dict]:
 
 def get_skip_timer_cost_gems_per_hour() -> int:
     return get_config()["skip_timer"]["cost_astral_gems_per_hour"]
+
+
+def get_daily_mana_cap() -> int:
+    """Single source of truth for the daily Mana cap.
+
+    Lua scripts read this from `config:daily_mana_cap` in Redis (seeded by
+    `sync_to_redis` at boot). Python callers should use this helper so we
+    never duplicate the constant.
+    """
+    return int(get_config()["economy"]["daily_mana_cap"])
+
+
+def get_world_boss_hp() -> int:
+    return int(get_config()["world_boss"]["boss_hp"])
+
+
+# ─── Redis sync ───────────────────────────────────────────────────────────────
+
+
+REDIS_KEY_DAILY_MANA_CAP = "config:daily_mana_cap"
+REDIS_KEY_WORLD_BOSS_HP = "config:world_boss_hp"
+
+
+def techtree_key(building_id: str, tier: int | str) -> str:
+    """Redis key holding the prereq hash for a given (building, tier)."""
+    return f"techtree:{building_id}:tier:{tier}"
+
+
+async def sync_to_redis(redis: aioredis.Redis) -> None:
+    """
+    Push master_config values into Redis so Lua scripts can read them.
+
+    Run at game_service startup. Idempotent — safe to re-run after config
+    changes. Uses a pipeline (not a transaction) since the consequences of
+    a partial sync are recoverable: stale Lua reads will fail gracefully and
+    the next sync corrects them.
+
+    Keys written:
+      config:daily_mana_cap          — int as string
+      config:world_boss_hp           — int as string
+      techtree:{building}:tier:{N}   — hash of {prereq_building: required_tier}
+    """
+    config = get_config()
+    pipe = redis.pipeline()
+
+    pipe.set(REDIS_KEY_DAILY_MANA_CAP, str(config["economy"]["daily_mana_cap"]))
+    pipe.set(REDIS_KEY_WORLD_BOSS_HP, str(config["world_boss"]["boss_hp"]))
+
+    for building_id, building in config["sanctuary"]["buildings"].items():
+        for tier_str, tier_data in building["tiers"].items():
+            key = techtree_key(building_id, tier_str)
+            # Always DEL first so removed prereqs don't linger from a prior sync.
+            pipe.delete(key)
+            requires = tier_data.get("requires", {})
+            if requires:
+                pipe.hset(key, mapping={k: str(v) for k, v in requires.items()})
+
+    await pipe.execute()
+    logger.info(
+        "Pushed game config to Redis: daily_mana_cap=%d, world_boss_hp=%d, "
+        "tech-tree entries written for %d buildings.",
+        config["economy"]["daily_mana_cap"],
+        config["world_boss"]["boss_hp"],
+        len(config["sanctuary"]["buildings"]),
+    )
