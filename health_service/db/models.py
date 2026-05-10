@@ -217,12 +217,6 @@ class DeviceAttestation(Base):
     """
 
     __tablename__ = "device_attestations"
-    __table_args__ = (
-        UniqueConstraint(
-            "user_id", "manufacturer", "device_id",
-            name="uq_user_manufacturer_device",
-        ),
-    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), nullable=False)
@@ -231,6 +225,19 @@ class DeviceAttestation(Base):
     hmac_key_encrypted: Mapped[str] = mapped_column(EncryptedString(), nullable=False)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+# Partial unique index — uniqueness only applies to ACTIVE attestations
+# (revoked_at IS NULL). After soft-revoke, the row stays for audit but no
+# longer blocks a fresh enrollment of the same (user, manufacturer, device).
+Index(
+    "uq_active_device_attestation",
+    DeviceAttestation.user_id,
+    DeviceAttestation.manufacturer,
+    DeviceAttestation.device_id,
+    unique=True,
+    postgresql_where=DeviceAttestation.revoked_at.is_(None),
+)
 
 
 class DeadLetterPayload(Base):

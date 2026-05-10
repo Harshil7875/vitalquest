@@ -18,6 +18,7 @@ from health_service.adapters.registry import initialize_registry
 from health_service.api.auth import router as auth_router
 from health_service.api.clinical import router as clinical_router
 from health_service.api.clinical import router_account
+from health_service.api.devices import router as devices_router
 from health_service.api.health import router as health_router
 from health_service.api.webhooks import router as webhooks_router
 from health_service.db.session import async_session_factory
@@ -71,6 +72,7 @@ app.include_router(health_router)
 app.include_router(webhooks_router)
 app.include_router(clinical_router)
 app.include_router(router_account)
+app.include_router(devices_router)
 
 
 @app.get("/health")

@@ -180,10 +180,16 @@ def upgrade() -> None:
         sa.Column('revoked_at', sa.DateTime(), nullable=True),
         sa.ForeignKeyConstraint(['user_id'], ['users.id']),
         sa.PrimaryKeyConstraint('id'),
-        sa.UniqueConstraint(
-            'user_id', 'manufacturer', 'device_id',
-            name='uq_user_manufacturer_device',
-        ),
+    )
+    # Partial unique index — uniqueness only on rows that haven't been
+    # soft-revoked. Re-enrolling after a revoke is a supported flow; the
+    # historical row stays for audit and the new row is the active one.
+    op.create_index(
+        'uq_active_device_attestation',
+        'device_attestations',
+        ['user_id', 'manufacturer', 'device_id'],
+        unique=True,
+        postgresql_where=sa.text('revoked_at IS NULL'),
     )
 
     op.create_table(
@@ -257,6 +263,7 @@ def downgrade() -> None:
     op.drop_table('reward_outbox')
     op.drop_table('guilds')
     op.drop_table('dead_letter_payloads')
+    op.drop_index('uq_active_device_attestation', table_name='device_attestations')
     op.drop_table('device_attestations')
     op.drop_table('device_tokens')
     op.drop_index('ix_oauth_tokens_provider_user_id', table_name='oauth_tokens')
