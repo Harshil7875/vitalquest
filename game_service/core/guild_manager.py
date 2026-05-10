@@ -15,14 +15,12 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 
 import redis.asyncio as aioredis
 
 from game_service.core.game_config import get_config, get_world_boss_hp
+from game_service.db.lua_runner import runner as lua_runner
 from game_service.db.redis_client import (
-    add_guild_member,
-    debit_mana_lua,
     get_game_state,
     get_guild_member_count,
     get_guild_roster,
@@ -54,39 +52,56 @@ async def create_guild(
     redis: aioredis.Redis,
 ) -> GuildActionResult:
     """
-    Creates a new guild. Deducts Mana atomically.
-    Assigns the creating user as Guildmaster.
+    Creates a new guild atomically via guild_create.lua.
+
+    Phase 9c / fix #21 — the previous flow debit'd Mana via debit_mana_lua
+    (atomic), then ran 5 separate writes (HSET guild hash, SET invite, SADD
+    roster, HSET role, HSET state). A crash between the debit and the
+    follow-up writes left the user with no guild and no Mana refund —
+    the idempotency_key was already consumed so retries returned
+    DUPLICATE_REQUEST. The single Lua now folds debit + every write
+    into one block, so partial failure is impossible.
     """
     config = get_config()
     creation_cost = config["economy"]["guild_creation_cost_mana"]
-
-    result = await debit_mana_lua(user_id, creation_cost, idempotency_key)
-    if isinstance(result, str):
-        return GuildActionResult(success=False, message=result)
-
-    # Generate a new guild ID (use Redis counter for simplicity)
-    guild_id = await redis.incr("game:guild_id_counter")
     invite_code = secrets.token_urlsafe(8)
+    now = str(int(time.time()))
 
-    await redis.hset(f"game:guild:{guild_id}", mapping={
-        "name": guild_name,
-        "invite_code": invite_code,
-        "guildmaster_user_id": str(user_id),
-        # Phase 8 / fix #24 — read boss HP from master_config, not a literal.
-        "boss_hp_remaining": str(get_world_boss_hp()),
-        "created_at": str(int(time.time())),
-    })
+    ok, value = await lua_runner.run(
+        redis,
+        "guild_create",
+        keys=[
+            f"game:state:{user_id}",
+            "game:guild_id_counter",
+        ],
+        args=[
+            creation_cost,
+            guild_name,
+            invite_code,
+            idempotency_key,
+            str(get_world_boss_hp()),
+            str(user_id),
+            now,
+        ],
+    )
+    if not ok:
+        message_map = {
+            "DUPLICATE_REQUEST": "Guild creation already processed.",
+            "INSUFFICIENT_MANA": f"Insufficient Mana to create a guild ({creation_cost} required).",
+        }
+        return GuildActionResult(success=False, message=message_map.get(value, value))
 
-    # Register invite code lookup
-    await redis.set(f"game:invite:{invite_code}", str(guild_id))
-
-    # Add creator to roster as Guildmaster
-    await add_guild_member(guild_id, user_id)
-    await redis.hset(f"game:guild:{guild_id}:roles", str(user_id), "guildmaster")
-    await _update_last_seen(user_id, redis)
-
-    logger.info("Guild %d '%s' created by user_id=%d", guild_id, guild_name, user_id)
-    return GuildActionResult(success=True, message="Guild created.", guild_id=guild_id, invite_code=invite_code)
+    new_balance, new_guild_id = value
+    logger.info(
+        "Guild %d '%s' created by user_id=%d (Mana balance now %d).",
+        new_guild_id, guild_name, user_id, new_balance,
+    )
+    return GuildActionResult(
+        success=True,
+        message="Guild created.",
+        guild_id=new_guild_id,
+        invite_code=invite_code,
+    )
 
 
 async def join_guild(
@@ -95,8 +110,14 @@ async def join_guild(
     guild_id: int | None = None,
 ) -> GuildActionResult:
     """
-    Joins a guild by invite code (private) or guild_id (public).
-    Enforces the 50-member capacity cap.
+    Joins a guild atomically via guild_join.lua.
+
+    Phase 9c / fix #21 — capacity-check + already-in-guild + roster-add are
+    now one indivisible block. The previous SCARD → HGET → SADD sequence
+    let 50 users joining a guild with 1 slot all pass the SCARD check
+    before any of them SADD'd, and a double-clicking user could land in
+    two guilds (the second HSET state.guild_id clobbered the first but
+    the user remained in both rosters).
     """
     redis = await get_redis()
 
@@ -108,19 +129,29 @@ async def join_guild(
     elif guild_id is None:
         return GuildActionResult(success=False, message="Must provide invite_code or guild_id.")
 
-    # Capacity check
-    current_count = await get_guild_member_count(guild_id)
-    if current_count >= GUILD_MAX_CAPACITY:
-        return GuildActionResult(success=False, message=f"Guild is full ({GUILD_MAX_CAPACITY} members).")
-
-    # Check user isn't already in a guild
-    state = await get_game_state(user_id)
-    if state.get("guild_id"):
-        return GuildActionResult(success=False, message="You must leave your current guild first.")
-
-    await add_guild_member(guild_id, user_id)
-    await redis.hset(f"game:guild:{guild_id}:roles", str(user_id), "member")
-    await _update_last_seen(user_id, redis)
+    now = str(int(time.time()))
+    ok, value = await lua_runner.run(
+        redis,
+        "guild_join",
+        keys=[
+            f"game:state:{user_id}",
+            f"game:guild:{guild_id}:roster",
+            f"game:guild:{guild_id}:roles",
+            "game:last_seen",
+        ],
+        args=[
+            str(user_id),
+            str(guild_id),
+            GUILD_MAX_CAPACITY,
+            now,
+        ],
+    )
+    if not ok:
+        message_map = {
+            "ALREADY_IN_GUILD": "You must leave your current guild first.",
+            "GUILD_FULL": f"Guild is full ({GUILD_MAX_CAPACITY} members).",
+        }
+        return GuildActionResult(success=False, message=message_map.get(value, value))
 
     logger.info("user_id=%d joined guild %d", user_id, guild_id)
     return GuildActionResult(success=True, message="Joined guild.", guild_id=guild_id)
@@ -158,15 +189,15 @@ async def kick_member(
 
 async def apply_grace_protocol(guild_id: int) -> None:
     """
-    Called by the nightly cron. Checks last_seen timestamps for all roster members
-    and transitions inactive members through the grace protocol states.
+    Called by the nightly cron. Checks last_seen timestamps for all roster
+    members and transitions inactive members through the grace protocol states.
     """
     redis = await get_redis()
     roster = await get_guild_roster(guild_id)
     now = time.time()
 
     for user_id_str in roster:
-        last_seen_str = await redis.hget(f"game:last_seen", user_id_str)
+        last_seen_str = await redis.hget("game:last_seen", user_id_str)
         if not last_seen_str:
             continue
 
@@ -185,11 +216,11 @@ async def apply_grace_protocol(guild_id: int) -> None:
             logger.info("user_id=%s moved to resting in guild %d", user_id_str, guild_id)
 
         else:
-            # Reactivate if they've logged in recently
             await redis.hset(
                 f"game:guild:{guild_id}:member_status", user_id_str, "active"
             )
 
 
 async def _update_last_seen(user_id: int, redis: aioredis.Redis) -> None:
+    """Kept for non-Lua call sites that need to refresh last_seen."""
     await redis.hset("game:last_seen", str(user_id), str(time.time()))
