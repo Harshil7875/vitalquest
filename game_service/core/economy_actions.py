@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import redis.asyncio as aioredis
 
@@ -168,6 +169,9 @@ async def skip_build_timer(
     )
 
 
+CHEST_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
+
 async def open_chest(
     user_id: int,
     chest_rarity: str,
@@ -175,32 +179,61 @@ async def open_chest(
     redis: aioredis.Redis,
 ) -> ActionResult:
     """
-    Opens a loot chest. Deducts the chest from inventory, rolls loot server-side,
-    deposits items. The client has no influence over what drops.
-    """
-    inventory_key = f"game:inventory:{user_id}:chests"
-    chest_count = int(await redis.hget(inventory_key, chest_rarity) or 0)
+    Opens a loot chest. Server-authoritative: client never sees the roll
+    until the server commits.
 
-    if chest_count <= 0:
+    Phase 9b / fix #14: atomic via open_chest.lua. The previous version
+    had four sequential commands and no idempotency_key check, so a crash
+    mid-deposit lost items and double-clicks double-spent chests. The
+    rolled items are now persisted under `chest_result:{idempotency_key}`
+    with a 7-day TTL — a retried request returns the same items (not a
+    fresh roll).
+    """
+    result_key = f"chest_result:{idempotency_key}"
+
+    # Idempotent replay: if the result was already persisted, return it
+    # without rerolling. Covers the case where the original response
+    # didn't reach the client (network drop) but the server committed.
+    persisted = await redis.get(result_key)
+    if persisted is not None:
+        items = _deserialize_items(persisted)
+        raw_state = await get_game_state(user_id)
         return ActionResult(
-            success=False,
-            message=f"No {chest_rarity} chests in inventory.",
+            success=True,
+            message="Chest opened (replay).",
+            new_mana_balance=int(raw_state.get("mana_balance", 0)),
+            items_granted=items,
         )
 
-    # Deduct chest atomically
-    new_count = await redis.hincrby(inventory_key, chest_rarity, -1)
-    if new_count < 0:
-        # Race condition guard: restore if someone else took the last chest
-        await redis.hincrby(inventory_key, chest_rarity, 1)
-        return ActionResult(success=False, message="Chest no longer available.")
-
-    # Roll loot (server-side, cryptographic RNG)
+    # Roll loot in Python — Lua isn't a good RNG home and we want
+    # secrets.SystemRandom backing the RNG.
     items = roll_chest(chest_rarity)
+    payload = _serialize_items(items)
 
-    # Deposit items into inventory
-    item_inventory_key = f"game:inventory:{user_id}:items"
+    # Build the flat ARGV pairs the Lua expects: (item_id, qty, ...).
+    item_args: list[Any] = []
     for item in items:
-        await redis.hincrby(item_inventory_key, item.item_id, item.quantity)
+        item_args.extend([item.item_id, item.quantity])
+
+    ok, value = await lua_runner.run(
+        redis,
+        "open_chest",
+        keys=[
+            f"game:inventory:{user_id}:chests",
+            f"game:inventory:{user_id}:items",
+            result_key,
+        ],
+        args=[chest_rarity, idempotency_key, payload, CHEST_RESULT_TTL_SECONDS, *item_args],
+    )
+
+    if not ok:
+        message_map = {
+            "DUPLICATE_REQUEST": "Chest already opened.",
+            "CHEST_EMPTY": f"No {chest_rarity} chests in inventory.",
+        }
+        return ActionResult(
+            success=False, message=message_map.get(value, value),
+        )
 
     raw_state = await get_game_state(user_id)
     logger.info(
@@ -213,3 +246,15 @@ async def open_chest(
         new_mana_balance=int(raw_state.get("mana_balance", 0)),
         items_granted=items,
     )
+
+
+def _serialize_items(items: list[ItemGrant]) -> str:
+    """JSON-encode rolled items for persistence under chest_result:{idem_key}."""
+    import json
+    return json.dumps([{"item_id": i.item_id, "quantity": i.quantity} for i in items])
+
+
+def _deserialize_items(payload: str) -> list[ItemGrant]:
+    import json
+    raw = json.loads(payload)
+    return [ItemGrant(item_id=r["item_id"], quantity=r["quantity"]) for r in raw]

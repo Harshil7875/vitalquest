@@ -112,3 +112,99 @@ class TestSkipBuildTimerWiring:
         )
         assert result.success is True
         assert "tier 2" in result.message
+
+
+class TestOpenChestPersistedRoll:
+    """Phase 9b / fix #14 — chest_result:{idem_key} drives idempotent replay."""
+
+    async def test_persisted_result_returns_same_items_no_reroll(self, stub_runner, monkeypatch):
+        # If chest_result:{idem_key} exists, we must return THOSE items —
+        # no fresh roll, no Lua call. Without this, a network-dropped
+        # response on a successful chest open would let the user retry
+        # and get a different set of items than what was already
+        # deposited.
+        from game_service.core import economy_actions as ea
+
+        roll_calls = []
+        def stub_roll(rarity):
+            roll_calls.append(rarity)
+            return [ea.ItemGrant(item_id="should_never_be_returned", quantity=99)]
+        monkeypatch.setattr(ea, "roll_chest", stub_roll)
+        monkeypatch.setattr(
+            ea, "get_game_state", AsyncMock(return_value={"mana_balance": "100"})
+        )
+
+        # Persisted payload for the previous, successful open.
+        persisted_json = '[{"item_id": "rare_gem", "quantity": 3}]'
+        redis = AsyncMock()
+        redis.get = AsyncMock(return_value=persisted_json)
+
+        result = await ea.open_chest(
+            user_id=42, chest_rarity="common",
+            idempotency_key="idem-replay", redis=redis,
+        )
+
+        assert result.success is True
+        assert "replay" in result.message.lower()
+        assert len(result.items_granted) == 1
+        assert result.items_granted[0].item_id == "rare_gem"
+        # No reroll happened — the audit's gotcha.
+        assert roll_calls == []
+        # No Lua call happened either.
+        assert stub_runner.calls == []
+
+    async def test_first_call_rolls_and_invokes_lua(self, stub_runner, monkeypatch):
+        from game_service.core import economy_actions as ea
+
+        monkeypatch.setattr(
+            ea, "roll_chest",
+            lambda r: [ea.ItemGrant(item_id="potion", quantity=2)],
+        )
+        monkeypatch.setattr(
+            ea, "get_game_state", AsyncMock(return_value={"mana_balance": "100"})
+        )
+
+        redis = AsyncMock()
+        redis.get = AsyncMock(return_value=None)  # no persisted result
+
+        stub_runner.queue(True, 1)
+
+        result = await ea.open_chest(
+            user_id=42, chest_rarity="common",
+            idempotency_key="idem-fresh", redis=redis,
+        )
+
+        assert result.success is True
+        # Lua got called with the chest_rarity, idem_key, payload, ttl, then
+        # flat (item_id, qty) pairs.
+        name, keys, args = stub_runner.calls[0]
+        assert name == "open_chest"
+        assert args[0] == "common"
+        assert args[1] == "idem-fresh"
+        # ARGV[3] is the result_payload_json — should round-trip the items.
+        import json
+        roundtrip = json.loads(args[2])
+        assert roundtrip == [{"item_id": "potion", "quantity": 2}]
+        # ARGV[4] is the TTL.
+        assert args[3] == ea.CHEST_RESULT_TTL_SECONDS
+        # ARGV[5..] is the flattened (item_id, qty) tail.
+        assert args[4:] == ["potion", 2]
+
+    async def test_lua_chest_empty_translated(self, stub_runner, monkeypatch):
+        from game_service.core import economy_actions as ea
+        monkeypatch.setattr(ea, "roll_chest", lambda r: [])
+        monkeypatch.setattr(
+            ea, "get_game_state", AsyncMock(return_value={"mana_balance": "100"})
+        )
+
+        redis = AsyncMock()
+        redis.get = AsyncMock(return_value=None)
+
+        stub_runner.queue(False, "CHEST_EMPTY")
+
+        result = await ea.open_chest(
+            user_id=42, chest_rarity="legendary",
+            idempotency_key="idem-x", redis=redis,
+        )
+        assert result.success is False
+        assert "no legendary chests" in result.message.lower()
