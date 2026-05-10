@@ -17,6 +17,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from health_service.config import settings
+from health_service.core.hardware_attestation import (
+    canonical_payload,
+    lookup_device_key,
+    verify as verify_hardware_signature,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +64,23 @@ class PipelineResult:
 class HardwareVerificationRule:
     """
     Rule 1: Payload must originate from a trusted hardware source.
-    Manual entries are logged clinically but earn no game rewards.
+
+    Phase 3 / fix #6: this is now a real HMAC check against a per-device key
+    stored in the `device_attestations` table — the previous version only
+    checked that `hardware_signature` was a non-empty string, which any
+    client could trivially satisfy.
+
+    Manual entries (no signature) and unknown devices (no enrolled key) are
+    logged clinically but earn no Mana. A signature that fails verification
+    is quarantined as a tampering attempt.
     """
 
-    def validate(self, payload: SyncPayload, result: PipelineResult) -> None:
+    async def validate(
+        self,
+        payload: SyncPayload,
+        result: PipelineResult,
+        db: AsyncSession,
+    ) -> None:
         if not payload.hardware_signature:
             result.reward_eligible = False
             result.clinical_log_only = True
@@ -76,6 +94,38 @@ class HardwareVerificationRule:
             result.clinical_log_only = True
             result.audit_notes.append(
                 f"Manufacturer '{payload.manufacturer}' not in allowlist."
+            )
+            return
+
+        key = await lookup_device_key(
+            db,
+            user_id=payload.user_id,
+            manufacturer=payload.manufacturer,
+            device_id=payload.device_id,
+        )
+        if key is None:
+            # Device not enrolled (or attestation revoked). Log clinically
+            # so no PHI is lost, but no Mana is awarded.
+            result.reward_eligible = False
+            result.clinical_log_only = True
+            result.audit_notes.append(
+                f"No active device attestation for device_id='{payload.device_id}'. "
+                "Treated as manual entry."
+            )
+            return
+
+        canonical = canonical_payload(
+            user_id=payload.user_id,
+            data_type=payload.data_type,
+            value=payload.value,
+            recorded_at=payload.recorded_at,
+        )
+        if not verify_hardware_signature(key, canonical, payload.hardware_signature):
+            # Signature mismatch. Quarantine and audit — likely tampering.
+            result.reward_eligible = False
+            result.quarantined = True
+            result.audit_notes.append(
+                "Hardware signature did not verify — payload quarantined as suspected tampering."
             )
 
 
@@ -161,7 +211,7 @@ async def run_pipeline(
     """
     result = PipelineResult()
 
-    HardwareVerificationRule().validate(payload, result)
+    await HardwareVerificationRule().validate(payload, result, db)
     VelocityCheckRule().validate(payload, result)
     await DailyCapRule().validate(payload, result, db)
 
