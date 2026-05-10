@@ -52,12 +52,15 @@ async def rotate_expiring_tokens() -> None:
 
 
 async def _refresh_token(token: OAuthToken, db: AsyncSession) -> None:
-    """Refresh a single token using the appropriate provider's API."""
+    """Refresh a single token using the appropriate provider's API.
+
+    The `_encrypted` columns now use the EncryptedString TypeDecorator
+    (Phase 1), so reads return plaintext and writes accept plaintext —
+    no manual encrypt/decrypt steps needed at this layer.
+    """
     try:
         if token.provider == "dexcom":
-            token_data = await dexcom_refresh(
-                token.refresh_token_encrypted  # TODO: decrypt before use
-            )
+            token_data = await dexcom_refresh(token.refresh_token_encrypted)
         else:
             logger.warning(
                 "No refresh implementation for provider '%s', skipping.", token.provider
@@ -65,9 +68,9 @@ async def _refresh_token(token: OAuthToken, db: AsyncSession) -> None:
             return
 
         new_expires_at = datetime.utcnow() + timedelta(seconds=token_data["expires_in"])
-        token.access_token_encrypted = token_data["access_token"]  # TODO: encrypt
+        token.access_token_encrypted = token_data["access_token"]
         if "refresh_token" in token_data:
-            token.refresh_token_encrypted = token_data["refresh_token"]  # TODO: encrypt
+            token.refresh_token_encrypted = token_data["refresh_token"]
         token.expires_at = new_expires_at
 
         logger.info(
