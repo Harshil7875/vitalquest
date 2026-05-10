@@ -85,7 +85,10 @@ def session():
 @pytest.fixture
 def fake_redis(monkeypatch):
     redis = AsyncMock()
+    # Phase 11 swapped the publish path from redis.publish to redis.xadd —
+    # keep both stubbed so the "no inline publish" assertion still holds.
     redis.publish = AsyncMock()
+    redis.xadd = AsyncMock()
 
     async def _get_redis():
         return redis
@@ -187,20 +190,22 @@ class TestDrainOutbox:
         assert published == 3
         # Each row should now have published_at set.
         assert all(r.published_at is not None for r in rows)
-        # Redis got 3 publishes.
-        assert fake_redis.publish.await_count == 3
+        # Phase 11: drainer publishes via XADD (Redis Stream) for at-least-once
+        # delivery semantics. The legacy redis.publish path is not used.
+        assert fake_redis.xadd.await_count == 3
+        assert fake_redis.publish.await_count == 0
 
     async def test_empty_outbox_no_op(self, session, fake_redis):
         session.seed_existing(RewardOutbox, [])
         published = await redis_publisher.drain_outbox(session)
         assert published == 0
-        assert fake_redis.publish.await_count == 0
+        assert fake_redis.xadd.await_count == 0
         assert session.committed is False  # nothing to commit
 
     async def test_publish_failure_keeps_row_unpublished(self, session, fake_redis):
-        # If the transport raises, the row's published_at must stay None so
-        # the next drain pass tries again.
-        fake_redis.publish.side_effect = ConnectionError("redis down")
+        # If the Stream transport raises, the row's published_at must stay
+        # None so the next drain pass tries again.
+        fake_redis.xadd.side_effect = ConnectionError("redis down")
         row = RewardOutbox(
             idempotency_key="k1", event_type="mana_award", payload_json="{}",
         )

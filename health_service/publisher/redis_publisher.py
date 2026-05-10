@@ -30,7 +30,12 @@ from shared.schemas import ErasureEvent, GuildDamageEvent, RewardEvent
 
 logger = logging.getLogger(__name__)
 
-REWARDS_CHANNEL = "health.rewards"
+# Phase 11 / fix #10 — switched from a Redis Pub/Sub channel (at-most-once)
+# to a Redis Stream (at-least-once with consumer-group acks). The Stream
+# name preserves the legacy "channel" string so dashboards and metrics
+# referencing health.rewards stay valid.
+REWARDS_STREAM = "health.rewards"
+REWARDS_CHANNEL = REWARDS_STREAM  # back-compat alias
 
 _redis_client: aioredis.Redis | None = None
 _drainer_task: asyncio.Task | None = None
@@ -186,8 +191,18 @@ async def drain_outbox(db: AsyncSession) -> int:
 
 
 async def _publish_one(redis: aioredis.Redis, row: RewardOutbox) -> None:
-    """Transport-specific publish. Swapped in Phase 11 for `redis.xadd`."""
-    await redis.publish(REWARDS_CHANNEL, row.payload_json)
+    """Transport-specific publish. Phase 11 / fix #10 — uses XADD on a Redis
+    Stream (durable + acked) instead of PUBLISH on a Pub/Sub channel.
+
+    The subscriber consumes via XREADGROUP and ACKs after process_reward_event
+    succeeds, so a subscriber crash mid-processing causes the entry to be
+    redelivered (XAUTOCLAIM on startup) instead of silently dropped.
+    """
+    await redis.xadd(
+        REWARDS_STREAM,
+        {"payload": row.payload_json},
+        # No MAXLEN — we want the full audit trail until manual archival.
+    )
 
 
 async def _drainer_loop(session_factory: async_sessionmaker[AsyncSession]) -> None:
