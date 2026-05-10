@@ -17,6 +17,7 @@ import redis.asyncio as aioredis
 from game_service.core.game_config import get_skip_timer_cost_gems_per_hour
 from game_service.core.loot import ItemGrant, calculate_skip_timer_cost, roll_chest
 from game_service.core.tech_tree import can_upgrade
+from game_service.db.lua_runner import runner as lua_runner
 from game_service.db.redis_client import (
     debit_mana_lua,
     get_build_timers,
@@ -112,7 +113,13 @@ async def skip_build_timer(
 ) -> ActionResult:
     """
     Pays Astral Gems to immediately complete a build timer.
-    Astral Gems are stored in game:state:{user_id}.astral_gems.
+
+    Phase 9a / fix #13 — atomic via skip_timer.lua. The previous version was
+    four sequential commands and ignored the idempotency_key, so retries
+    double-charged gems and a crash mid-sequence corrupted state (gems gone
+    but tier not promoted, or tier promoted but timer not cleared blocking
+    the next upgrade). The Lua does idempotency-check + gem-debit + tier-
+    promote + timer-clear in one block.
     """
     timers = await get_build_timers(user_id)
     complete_at_key = f"{building_id}:complete_at"
@@ -124,32 +131,39 @@ async def skip_build_timer(
     complete_at = int(timers[complete_at_key])
     remaining_minutes = max(0, (complete_at - int(time.time())) // 60)
     gem_cost = calculate_skip_timer_cost(remaining_minutes)
+    next_tier = int(timers.get(tier_key, 1))
 
-    raw_state = await get_game_state(user_id)
-    gem_balance = int(raw_state.get("astral_gems", 0))
+    ok, value = await lua_runner.run(
+        redis,
+        "skip_timer",
+        keys=[
+            f"game:state:{user_id}",
+            f"game:builds:{user_id}",
+            f"game:sanctuary:{user_id}",
+        ],
+        args=[building_id, gem_cost, next_tier, idempotency_key],
+    )
 
-    if gem_balance < gem_cost:
+    if not ok:
+        # Translate Lua error tokens to user-facing messages.
+        message_map = {
+            "DUPLICATE_REQUEST": "Skip timer already processed.",
+            "INSUFFICIENT_GEMS": f"Insufficient Astral Gems: need {gem_cost}.",
+            "TIMER_NOT_ACTIVE": "No active build timer for this building.",
+        }
         return ActionResult(
-            success=False,
-            message=f"Insufficient Astral Gems: need {gem_cost}, have {gem_balance}.",
+            success=False, message=message_map.get(value, value),
         )
 
-    # Deduct gems and finalize build
-    await redis.hincrby(f"game:state:{user_id}", "astral_gems", -gem_cost)
-    await redis.hdel(f"game:builds:{user_id}", complete_at_key)
-
-    next_tier = int(timers.get(tier_key, 1))
-    sanctuary_key = f"game:sanctuary:{user_id}"
-    await redis.hset(sanctuary_key, building_id, next_tier)
-    await redis.hdel(f"game:builds:{user_id}", tier_key)
-
+    new_gem_balance, applied_tier = value
+    raw_state = await get_game_state(user_id)
     logger.info(
         "user_id=%d skipped timer for %s tier %d, spent %d Astral Gems",
-        user_id, building_id, next_tier, gem_cost,
+        user_id, building_id, applied_tier, gem_cost,
     )
     return ActionResult(
         success=True,
-        message=f"{building_id} upgraded to tier {next_tier} instantly.",
+        message=f"{building_id} upgraded to tier {applied_tier} instantly.",
         new_mana_balance=int(raw_state.get("mana_balance", 0)),
     )
 
