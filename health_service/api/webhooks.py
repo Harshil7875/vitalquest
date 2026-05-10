@@ -104,15 +104,25 @@ async def oauth_callback(
     )
     existing: OAuthToken | None = (await db.execute(stmt)).scalar_one_or_none()
 
+    # The provider_user_id (Dexcom's stable identifier for this patient) is
+    # required to resolve incoming webhooks back to this user — see
+    # _resolve_user_id below. Phase 2 (#1) replaces this placeholder with a
+    # real call to the provider's /userinfo endpoint.
+    provider_user_id = token_data.get("provider_user_id") or f"pending-{current_user.id}"
+
+    # access_token / refresh_token are stored via EncryptedString TypeDecorator,
+    # so assigning plaintext below produces ciphertext at rest automatically.
     if existing:
-        existing.access_token_encrypted = token_data["access_token"]  # TODO: encrypt
-        existing.refresh_token_encrypted = token_data["refresh_token"]  # TODO: encrypt
+        existing.access_token_encrypted = token_data["access_token"]
+        existing.refresh_token_encrypted = token_data["refresh_token"]
         existing.expires_at = expires_at.replace(tzinfo=None)
         existing.scope = token_data.get("scope", "")
+        existing.provider_user_id = provider_user_id
     else:
         db.add(OAuthToken(
             user_id=current_user.id,
             provider=provider,
+            provider_user_id=provider_user_id,
             access_token_encrypted=token_data["access_token"],
             refresh_token_encrypted=token_data["refresh_token"],
             expires_at=expires_at.replace(tzinfo=None),
@@ -210,10 +220,11 @@ def _extract_provider_user_id(provider: str, body: dict) -> str:
 
 
 async def _to_dead_letter(source: str, raw_bytes: bytes, error: str, db: AsyncSession) -> None:
-    """Send a failed payload to the Dead Letter Queue for engineering review."""
+    """Send a failed payload to the Dead Letter Queue for engineering review.
+    raw_body is stored via EncryptedString TypeDecorator — ciphertext at rest."""
     db.add(DeadLetterPayload(
         source=source,
-        raw_body_encrypted=raw_bytes.decode("utf-8", errors="replace"),  # TODO: encrypt
+        raw_body_encrypted=raw_bytes.decode("utf-8", errors="replace"),
         error_message=error,
     ))
     logger.error("Payload from '%s' sent to DLQ: %s", source, error)
