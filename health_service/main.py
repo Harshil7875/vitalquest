@@ -20,6 +20,8 @@ from health_service.api.clinical import router as clinical_router
 from health_service.api.clinical import router_account
 from health_service.api.health import router as health_router
 from health_service.api.webhooks import router as webhooks_router
+from health_service.db.session import async_session_factory
+from health_service.publisher.redis_publisher import start_outbox_drainer
 from health_service.tasks.guild_cron import create_scheduler
 from health_service.tasks.oauth_token_rotation import rotate_expiring_tokens
 
@@ -40,8 +42,18 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     scheduler.start()
-    yield
-    scheduler.shutdown(wait=False)
+
+    # Outbox drainer (Phase 5 / fix #19): publishes RewardOutbox rows to Redis
+    # AFTER the originating transaction commits. Without this, a publish that
+    # races a transaction rollback would award Mana on the game side without
+    # a corresponding ManaLedger row.
+    drainer_task = start_outbox_drainer(async_session_factory)
+
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+        drainer_task.cancel()
 
 
 app = FastAPI(
