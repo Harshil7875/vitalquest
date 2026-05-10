@@ -10,14 +10,13 @@ Victory condition: boss_hp_remaining <= 0.
 
 from __future__ import annotations
 
-import json
 import logging
-import uuid
 
 import redis.asyncio as aioredis
 
-from game_service.core.game_config import get_config
+from game_service.core.game_config import get_world_boss_hp
 from game_service.core.loot import roll_chest
+from game_service.db.lua_runner import runner as lua_runner
 from game_service.db.redis_client import add_guild_damage, get_guild_roster
 
 logger = logging.getLogger(__name__)
@@ -25,32 +24,44 @@ logger = logging.getLogger(__name__)
 
 async def apply_guild_damage(guild_id: int, damage: int, redis: aioredis.Redis) -> bool:
     """
-    Deducts damage from the boss HP. Returns True if the boss was just defeated.
+    Deducts damage from the boss HP atomically via boss_damage.lua.
+
+    Phase 8 / fix #12 — the previous Python did HGET → compute → HSET,
+    which lost damage under concurrent events. The Lua does HSETNX-init
+    plus HINCRBY in one atomic block.
+
+    Phase 8 / fix #24 — initial HP is read via game_config.get_world_boss_hp(),
+    not a literal that used to live in this file and in
+    guild_manager.create_guild.
+
+    Returns True only when THIS specific damage event drove HP from >0 to
+    <=0 — subsequent damage events after the kill don't re-fire loot
+    distribution.
     """
+    initial_hp = get_world_boss_hp()
     guild_key = f"game:guild:{guild_id}"
-    config = get_config()
-    initial_hp = config["world_boss"]["boss_hp"]
 
-    # Initialize HP if not set (first damage event of the raid week)
-    current_hp_str = await redis.hget(guild_key, "boss_hp_remaining")
-    if current_hp_str is None:
-        await redis.hset(guild_key, "boss_hp_remaining", str(initial_hp))
-        current_hp_str = str(initial_hp)
-
-    current_hp = int(current_hp_str)
-    if current_hp <= 0:
-        # Boss already defeated this week
+    ok, value = await lua_runner.run(
+        redis,
+        "boss_damage",
+        keys=[guild_key],
+        args=[damage, initial_hp],
+    )
+    if not ok:
+        logger.error("boss_damage.lua returned error '%s' for guild_id=%d", value, guild_id)
         return False
 
-    new_hp = max(0, current_hp - damage)
-    await redis.hset(guild_key, "boss_hp_remaining", str(new_hp))
+    new_hp, defeated_flag = value
 
-    # Also log daily damage for the progress bar
+    # Daily damage progress bar — separate hash field, separate update path.
+    # Not in the Lua because progress is a per-day cumulative and the Lua
+    # would need the date as another KEY; keeping it as a follow-up call is
+    # safe under concurrency for additive counters (HINCRBY is atomic).
     await add_guild_damage(guild_id, damage)
 
-    boss_defeated = new_hp == 0
+    boss_defeated = bool(defeated_flag)
     if boss_defeated:
-        logger.info("World Boss defeated by guild %d!", guild_id)
+        logger.info("World Boss defeated by guild %d (final HP=%d).", guild_id, new_hp)
 
     return boss_defeated
 

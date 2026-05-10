@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 import redis.asyncio as aioredis
 
-from game_service.core.game_config import get_config
+from game_service.core.game_config import get_config, get_world_boss_hp
 from game_service.db.redis_client import (
     add_guild_member,
     debit_mana_lua,
@@ -72,7 +72,8 @@ async def create_guild(
         "name": guild_name,
         "invite_code": invite_code,
         "guildmaster_user_id": str(user_id),
-        "boss_hp_remaining": "100000",
+        # Phase 8 / fix #24 — read boss HP from master_config, not a literal.
+        "boss_hp_remaining": str(get_world_boss_hp()),
         "created_at": str(int(time.time())),
     })
 
