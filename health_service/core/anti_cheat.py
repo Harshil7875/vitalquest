@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from health_service.config import settings
@@ -171,6 +171,16 @@ class DailyCapRule:
     """
     Rule 3: Enforce the daily Mana cap to prevent unhealthy over-exertion.
     Requires a database session to check today's awarded total.
+
+    Phase 6 / fix #16 — pg_advisory_xact_lock keyed on the user serializes
+    concurrent /sync requests, so two parallel pipelines can't both pass
+    the cap check. The lock is held until transaction commit, by which
+    time the previous request's ManaLedger row has been written and is
+    visible to this request's SUM query.
+
+    Phase 6 / fix #17 — the cap window respects the user's IANA timezone
+    (column added in Phase 1, defaults to UTC). A US-Pacific user can no
+    longer farm rewards twice per civil day around UTC midnight.
     """
 
     async def validate(
@@ -179,12 +189,32 @@ class DailyCapRule:
         result: PipelineResult,
         db: AsyncSession,
     ) -> None:
-        from health_service.db.models import ManaLedger
+        from health_service.db.models import ManaLedger, User
 
-        today = date.today()
+        # Per-user serialization. hashtext + advisory_xact_lock takes a
+        # 32-bit key; "mana_cap:" prefix gives us a separate lock space
+        # from any other advisory lock in the application.
+        await db.execute(
+            text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"),
+            {"lock_key": f"mana_cap:{payload.user_id}"},
+        )
+
+        # Look up the user's timezone (defaults to UTC). We don't fetch the
+        # whole User row; just the column.
+        tz_row = (
+            await db.execute(
+                select(User.timezone).where(User.id == payload.user_id)
+            )
+        ).first()
+        user_tz = (tz_row[0] if tz_row else None) or "UTC"
+
+        # SUM(amount) for today, in the user's timezone. The
+        # `timezone(user_tz, awarded_at)::date` expression converts the
+        # naive-UTC `awarded_at` into the user's local civil date.
         stmt = select(func.sum(ManaLedger.amount)).where(
             ManaLedger.user_id == payload.user_id,
-            func.date(ManaLedger.awarded_at) == today,
+            func.date(func.timezone(user_tz, ManaLedger.awarded_at))
+            == func.date(func.timezone(user_tz, func.now())),
         )
         row = await db.execute(stmt)
         awarded_today: int = row.scalar_one_or_none() or 0
