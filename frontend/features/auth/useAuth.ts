@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { authStorage } from './authStorage';
 import { useGameStore } from '../../store/useGameStore';
 import { useClinicalStore } from '../../store/useClinicalStore';
@@ -32,6 +33,10 @@ export function useAuth(): UseAuthReturn {
 
   const resetGameStore = useGameStore((s) => s.reset);
   const clearClinicalData = useClinicalStore((s) => s.clearSensitiveData);
+  // Phase 13 / fix #8 — sign-out must invalidate the TanStack Query cache.
+  // Without this, user A's gameState / clinicalExport queries linger after
+  // their token is wiped and user B inherits them on first render.
+  const queryClient = useQueryClient();
 
   // Hydrate from secure storage on mount
   useEffect(() => {
@@ -60,8 +65,12 @@ export function useAuth(): UseAuthReturn {
     await authStorage.clear();
     resetGameStore();
     clearClinicalData();
+    // Drop every cached query — defense-in-depth alongside the user-scoped
+    // query keys. removeQueries leaves the QueryClient instance intact so
+    // active observers re-fetch cleanly when the next user signs in.
+    queryClient.clear();
     setState({ token: null, userId: null, isLoading: false, isAuthenticated: false });
-  }, [resetGameStore, clearClinicalData]);
+  }, [resetGameStore, clearClinicalData, queryClient]);
 
   return { ...state, signIn, signOut };
 }
