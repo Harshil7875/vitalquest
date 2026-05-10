@@ -19,18 +19,18 @@ Key conventions:
 from __future__ import annotations
 
 from datetime import date, timedelta
-from pathlib import Path
 
 import redis.asyncio as aioredis
 
 from game_service.config import settings
+from game_service.db.lua_runner import register_default_scripts, runner as lua_runner
 
 _pool: aioredis.Redis | None = None
 
-# Load Lua scripts at module level (registered on first use)
-_SCRIPTS_DIR = Path(__file__).parent.parent / "scripts"
-_MANA_DEBIT_SCRIPT = (_SCRIPTS_DIR / "mana_debit.lua").read_text()
-_BUILD_TIMER_SCRIPT = (_SCRIPTS_DIR / "build_timer_set.lua").read_text()
+# Register every .lua script in game_service/scripts/ with the module-level
+# LuaRunner singleton at import time. Idempotent — safe to call repeatedly.
+# Tests that want isolated runners construct their own LuaRunner instance.
+register_default_scripts()
 
 
 async def get_redis() -> aioredis.Redis:
@@ -86,18 +86,24 @@ async def debit_mana_lua(
     user_id: int, cost: int, idempotency_key: str
 ) -> int | str:
     """
-    Atomically debits Mana. Returns new balance (int) or an error string.
-    Uses mana_debit.lua — reads, validates, and deducts in a single EVAL.
+    Atomically debits Mana. Returns new balance (int) on success or an error
+    token (str) like "INSUFFICIENT_MANA" or "DUPLICATE_REQUEST".
+
+    Phase 4 / fix #20 — previously this function read `redis.eval` and
+    returned the raw result, but Lua's `return {err = "..."}` raises
+    redis.exceptions.ResponseError instead of returning a string. The
+    `isinstance(result, str)` checks at every call site never matched, so
+    `INSUFFICIENT_MANA` bubbled to FastAPI as a 500. Now routed through
+    LuaRunner which catches ResponseError and translates the error token.
     """
     redis = await get_redis()
-    result = await redis.eval(
-        _MANA_DEBIT_SCRIPT,
-        1,
-        f"game:state:{user_id}",
-        cost,
-        idempotency_key,
+    ok, value = await lua_runner.run(
+        redis,
+        "mana_debit",
+        keys=[f"game:state:{user_id}"],
+        args=[cost, idempotency_key],
     )
-    return result
+    return value  # int on success, str on Lua error — caller does isinstance check.
 
 
 async def set_build_timer_lua(
@@ -110,22 +116,19 @@ async def set_build_timer_lua(
     redis: aioredis.Redis | None = None,
 ) -> int | str:
     """
-    Atomically debits Mana and sets build timer. Returns new balance or error string.
+    Atomically debits Mana and sets the build timer. Returns new balance (int)
+    or an error token (str). See `debit_mana_lua` for context on the
+    Phase 4 rewrite.
     """
     if redis is None:
         redis = await get_redis()
-    result = await redis.eval(
-        _BUILD_TIMER_SCRIPT,
-        2,
-        f"game:state:{user_id}",
-        f"game:builds:{user_id}",
-        mana_cost,
-        building_id,
-        complete_at_unix,
-        next_tier,
-        idempotency_key,
+    ok, value = await lua_runner.run(
+        redis,
+        "build_timer_set",
+        keys=[f"game:state:{user_id}", f"game:builds:{user_id}"],
+        args=[mana_cost, building_id, complete_at_unix, next_tier, idempotency_key],
     )
-    return result
+    return value
 
 
 # ─── Economy Ledger (spend side) ──────────────────────────────────────────────
